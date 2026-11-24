@@ -83,11 +83,11 @@ $env:VICTORY_XCL_SHADERS='...\sidecar'
 
 ## 数据前提（重要）
 
-泄露包本身不完整：**76/13,345 个 piece 坏、1.19 GiB**，`anim.rpf` 有 16 MiB 全零洞，
+该游戏（最新发售的那个 Xbox 标题，下面只叫「该游戏」，不写名字）的包本身不完整：**76/13,345 个 piece 坏、1.19 GiB**，`anim.rpf` 有 16 MiB 全零洞，
 两个项目都会在 `+0x4da6315` 撞同一个 `int3`。修复方法、`fastresume` 位图坑、
 共享句柄坑见 [docs/DATA.md](docs/DATA.md)。
 
 ## 许可
 
-桥的胶水：GPL-3.0-or-later（同 VIctory）。`patches/xcl` 打到 GPL-2.0-only 的 XCL 上，
+桥的胶水：GPL-3.0-or-later（同 VIctory）。文中不写该游戏的名字，路径里的 `gta6` 只是作者的工作目录名。`patches/xcl` 打到 GPL-2.0-only 的 XCL 上，
 各自保持自己的许可；两者只在运行期通过进程 + JSON 交接。仓库不含任何游戏数据。
