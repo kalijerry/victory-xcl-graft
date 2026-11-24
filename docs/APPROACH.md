@@ -30,7 +30,7 @@ VIctory 是 GPL-3.0-or-later，XCL 是 GPL-2.0-only；GPL-3 的代码不能直�
 }
 ```
 
-除 `stage`/`dxil_file` 外都可缺省或为空。生产者现在会额外给出 `user_data`（程序读到的 user-data dword 序号，`s4`=0）与 `reads_res`/`reads_mem`。`user_data` 的 `slot`/`kind` 缺省时不进根签名（draw 路径的空白 buffer 兜住），等运行期按标题根签名补上再填。`samplers` 是 console 采样器描述字，XCL 会在末尾多给
+除 `stage`/`dxil_file` 外都可缺省或为空。生产者额外给出 `user_data`（程序读到的 SGPR 号）与 `reads_res`/`reads_mem`。SGPR 号与控制台根签名同基准，消费者拿容器里自带的那份根签名（`native_programs`）反查 `slot`/`kind`/`dword`；查不到的条目才退回空白 buffer 兜底。`samplers` 是 console 采样器描述字，XCL 会在末尾多给
 一个比较位（0/1），接受并忽略。
 
 ### ABI
