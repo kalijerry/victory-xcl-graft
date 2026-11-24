@@ -14,6 +14,26 @@ XCL 只当**翻译器进程**：两份 GPL 不兼容（VIctory GPL-3.0-or-later�
 > WARP 是诚实刻度（节拍稳、XCL 的 compute 跑不了）：失败 441 → 65、每帧丢 1,533 → 1,289。
 > 细节与它意味着什么：[docs/MEASUREMENTS.md](docs/MEASUREMENTS.md)。
 
+## 进度
+
+对外追踪器把这条线放在 **67%** 一档（2026-11-24 19:5x；榜首 CGBJ 72%，私有、已进游戏）。
+**启动 → 菜单 → 法务 → 开场 CG（真显卡 1080p）通过，已跑到世界加载**；卡点是世界加载里一次
+5 秒的提交触发驱动 TDR。证据、阶梯、A/B 与"还没做"：**[docs/PROGRESS.md](docs/PROGRESS.md)**。
+
+同一帧、同一 sidecar，只切换绑定（左＝空白 buffer，右＝真绑定）：
+
+| 空白 buffer | 真绑定 |
+|---|---|
+| ![blank](docs/screens/hw-blank-800.png) | ![bound](docs/screens/hw-bound-800.png) |
+
+```
+frame-800：15 种颜色 / 13.9 KB / 一片平色   →   571 种颜色 / 3.5 MB / 真实画面
+```
+
+真显卡 CG（`docs/screens/cg-360.png`、`cg-420.png`）：
+
+![cg](docs/screens/cg-420.png)
+
 ## 为什么不是"把两个项目合了"
 
 * 公开报道里的 CGBJ（私有）就是"VIctory 基底 + 借 XCL 的工作"这么进游戏的，代码没公开；

@@ -18,6 +18,27 @@ line — no linking.
 "the game" below means the newly released Xbox Series title; this repo never spells its name,
 and the `gta6` in paths is just the author's working directory.
 
+## Progress
+
+The public tracker puts this line at **67%** (2026-11-24 19:5x; CGBJ leads at 72%, private, in-game).
+**Boot → menus → legal → the opening CG on a real GPU at 1080p passes, and the run reaches world
+loading**; the blocker is a single ~5 s world-load submission that trips a driver TDR. Ladder,
+evidence, A/B and what is not done: **[docs/PROGRESS.md](docs/PROGRESS.md)**.
+
+Same frame, same sidecar, only the bindings switched (left = blank buffer, right = real bindings):
+
+| blank | bound |
+|---|---|
+| ![blank](docs/screens/hw-blank-800.png) | ![bound](docs/screens/hw-bound-800.png) |
+
+```
+frame-800: 15 colours / 13.9 KB / flat   ->   571 colours / 3.5 MB / real imagery
+```
+
+The CG on hardware (`docs/screens/cg-360.png`, `cg-420.png`):
+
+![cg](docs/screens/cg-420.png)
+
 ## Why not "merge the two projects"
 
 * The private CGBJ build is exactly "VIctory base + borrowed XCL work" and it got in game; its
