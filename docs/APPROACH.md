@@ -62,3 +62,16 @@ wave64 compute 必须走 split 形式，否则 D3D12 以 `E_INVALIDARG` 拒 PSO�
 对失败容器算**容器 BLAKE3**（与 VIctory 的 shader 缓存同一个键，完整 64 hex、
 `shaders/<前两位>/` 目录镜像其布局），调用 `xcl dxil`，写 `.json` + `.dxil`。
 已存在即跳过，可断点续跑；失败按原因计数——那就是两个翻译器都不覆盖的集合。
+
+## ABI 的根参数与窗口（绑定实现）
+
+`u0 io` 每 draw 一块真实 UAV：低 dword 区内是 user data，`io[112]`（`IO_UMA_BASE_HI`）是窗口基址，
+生成代码的 `xcl_uma_base` 从它取。`u1 res` 是低 chunk 上、只覆盖着色器可见描述符堆范围的窗口
+（本移植里 32 位描述符指针就是绝对地址，必须从地址 0 起）。`u2..u5` 是自基址起每个 4 GiB 一块的窗口；
+`hi == 0` 必须选中窗口 0，所以基址是 0，`uma_base_hi` 供将来换块。
+
+资源种类：**在标题自己的内存上 `OpenExistingHeapFromAddress` + `CreatePlacedResource` 做 placed UAV**
+（必须带 `ALLOW_CROSS_ADAPTER`，否则一律 `E_INVALIDARG`，WARP 与 3080 都验过）；
+没有恰好起在该块基址的保留时（chunk 0 总是如此，`OpenExistingHeapFromAddress(null)` 被拒）退化为
+**受限的 L0 写回拷贝**：懒建、只提交用到的前缀（`VICTORY_XCL_WINDOW_CAP`，默认 1 GiB）、
+首次使用拷贝、之后用既有 write-watch 抓标题写过的页刷新。所有创建都懒、带缓存、失败回退空白 buffer。
