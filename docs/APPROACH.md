@@ -30,7 +30,7 @@ VIctory 是 GPL-3.0-or-later，XCL 是 GPL-2.0-only；GPL-3 的代码不能直�
 }
 ```
 
-除 `stage`/`dxil_file` 外都可缺省或为空。`samplers` 是 console 采样器描述字，XCL 会在末尾多给
+除 `stage`/`dxil_file` 外都可缺省或为空。生产者现在会额外给出 `user_data`（程序读到的 user-data dword 序号，`s4`=0）与 `reads_res`/`reads_mem`；`user_data` 的 `slot`/`kind` 仍需按标题根签名在运行期补（XCL 只有容器，没有根签名）。`samplers` 是 console 采样器描述字，XCL 会在末尾多给
 一个比较位（0/1），接受并忽略。
 
 ### ABI
