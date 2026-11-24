@@ -61,3 +61,14 @@ WARP 是这批改动唯一的诚实刻度：没有 GPU 编译积压干扰，失�
 帧：`capture-bound/frame-256.png` vs `capture-blank/frame-256.png`。
 
 样例 sidecar 的全部 363 条 DXIL 都过了 `dxv` 校验（`gta6\cl-sidecar-win`）。
+
+
+## 逐窗 chunk（窗口不再假设连续）
+
+窗口现在按 sidecar 的 `window_hi` 逐窗指定（生产者 `--window-hi 13,15,16`），生成代码按地址的
+chunk 比较选窗、未命中走 `default`（读 0、写丢）。代价：每个 `mem` 访问变成多路 switch，
+DXIL 大 3-5 倍、DXC 慢 10-100 倍——一次性离线成本，所以单窗形式保留给低 32 位。
+
+真机（WARP）在 3 个真实 chunk 的 sidecar 下跑到世界加载（frame 2584、0.9 fps、14 GB），
+日志 1384 次 fallback 命中、无窗口创建告警，随后在同一类 30-list 提交上被软件设备收掉
+（与绑定改前同帧段，非新回归）。本轮没抓到帧：`VICTORY_CAPTURE_FRAMES` 的帧号早于世界加载。
