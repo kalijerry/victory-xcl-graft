@@ -75,7 +75,7 @@ $env:VICTORY_XCL_SHADERS='...\sidecar'
 
 ## 还缺什么（按优先级）
 
-1. **绑定面**（进行中）：生产者已报 `user_data`（SGPR 号）与 `reads_res`/`reads_mem`；消费者按容器自带的根签名把 SGPR 解析成 `slot`/`kind`/`dword`（已测）。还差把 `u1 res` / `u2..u5 mem` 真接到标题内存；`user_data`、`u1 res` / `u2..u5 mem` 全空 → 现在只保证
+1. **绑定面（已落地，画面仍不对）**：`u0 io` 现在是真的 per-draw UAV（user data + `io[112]` 窗口基址），`u1 res` 是描述符堆窗口，`u2..u5 mem` 是按 4 GiB 块切的标题内存窗口——优先用 `OpenExistingHeapFromAddress` 把标题自己的内存做成 placed UAV（零拷贝），没有现成保留就从标题写过的页懒拷一份（有上限、write-watch 刷新）。**仍错的**：实际只覆盖 chunk 0（标题的 UMA 在 chunk 13/15/16，要 XCL 出每窗基址表）；着色器写进拷贝窗口不回写；拷贝是快照；零拷贝路径只在独立探针里验证过，硬件未跑；`user_data`、`u1 res` / `u2..u5 mem` 全空 → 现在只保证
    "不丢、能 bind"，初值 SGPR 和地址读回 0，画面缺元素。需要 XCL 翻译时把"读了哪些
    user-data dword、地址从哪个 u 寄存器来、对应哪个根参数"报出来。
 2. **大 DXIL 的编译积压**：XCL 的 DXIL 10–100 倍大，要做 sidecar 管线的离线预编译
