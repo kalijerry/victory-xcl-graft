@@ -75,7 +75,7 @@ $env:VICTORY_XCL_SHADERS='...\sidecar'
 
 ## 还缺什么（按优先级）
 
-1. **绑定面**：sidecar 已带 `user_data`（读到的 dword 序号）与 `reads_res`/`reads_mem`，但 `slot`/`kind` 与 `u1/u2..u5` 的实际绑定还没接；`user_data`、`u1 res` / `u2..u5 mem` 全空 → 现在只保证
+1. **绑定面**（进行中）：生产者已报 `user_data`（dword 序号）与 `reads_res`/`reads_mem`，消费者也能解；还差按标题根签名解析 `slot`/`kind`、以及把 `u1 res` / `u2..u5 mem` 真接到标题内存；`user_data`、`u1 res` / `u2..u5 mem` 全空 → 现在只保证
    "不丢、能 bind"，初值 SGPR 和地址读回 0，画面缺元素。需要 XCL 翻译时把"读了哪些
    user-data dword、地址从哪个 u 寄存器来、对应哪个根参数"报出来。
 2. **大 DXIL 的编译积压**：XCL 的 DXIL 10–100 倍大，要做 sidecar 管线的离线预编译

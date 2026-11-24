@@ -83,7 +83,7 @@ $env:VICTORY_XCL_SHADERS='...\sidecar'
 
 ## Still missing, in order
 
-1. **Bindings**: the sidecar now carries `user_data` (dword indexes the program reads) and `reads_res`/`reads_mem`, but `slot`/`kind` and the actual `u1`/`u2..u5` bindings are not wired yet; `user_data`, `u1 res` and the `u2..u5 mem`
+1. **Bindings** (in progress): the producer reports `user_data` dwords and `reads_res`/`reads_mem` and the consumer decodes them; still to do: resolve `slot`/`kind` against the title root signature and bind `u1 res` / `u2..u5 mem` to title memory for real; `user_data`, `u1 res` and the `u2..u5 mem`
    windows are empty, so today only "not dropped, binds" holds — initial SGPRs and address
    reads come back 0 and scene elements are missing. XCL has to report which user-data dwords a
    program reads, which `u` register an address term comes from, and which root parameter that
