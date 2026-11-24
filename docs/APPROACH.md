@@ -67,8 +67,7 @@ wave64 compute 必须走 split 形式，否则 D3D12 以 `E_INVALIDARG` 拒 PSO�
 
 `u0 io` 每 draw 一块真实 UAV：低 dword 区内是 user data，`io[112]`（`IO_UMA_BASE_HI`）是窗口基址，
 生成代码的 `xcl_uma_base` 从它取。`u1 res` 是低 chunk 上、只覆盖着色器可见描述符堆范围的窗口
-（本移植里 32 位描述符指针就是绝对地址，必须从地址 0 起）。`u2..u5` 是自基址起每个 4 GiB 一块的窗口；
-`hi == 0` 必须选中窗口 0，所以基址是 0，`uma_base_hi` 供将来换块。
+（本移植里 32 位描述符指针就是绝对地址，必须从地址 0 起）。`u2..u5` 每个是一个 4 GiB 控制台 chunk，**由 sidecar 的 `window_hi` 逐窗给定**（生产者 `--window-hi 13,15,16`）；生成代码按地址的 chunk 号比较选窗，未命中走 `default`（读 0、写丢）。`hi == 0` 映射到窗口 0。多窗会让每个 `mem` 访问变成多路 switch：DXIL 变大、DXC 慢 10-100 倍（一次性离线成本），单窗仍是低 32 位的旧形式。
 
 资源种类：**在标题自己的内存上 `OpenExistingHeapFromAddress` + `CreatePlacedResource` 做 placed UAV**
 （必须带 `ALLOW_CROSS_ADAPTER`，否则一律 `E_INVALIDARG`，WARP 与 3080 都验过）；
