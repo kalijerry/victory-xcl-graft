@@ -1,5 +1,7 @@
 # VIctory ⇄ XCL 桥（victory-xcl-graft）
 
+English: [README.en.md](README.en.md)
+
 把 [VIctory](https://github.com/Marvisak/VIctory) 缺的那一半——[XCL](https://github.com/ivall/xcl)
 100% 覆盖的 RDNA2→DXIL 翻译——接进 VIctory，让世界着色器不再被丢掉。VIctory 当基底，
 XCL 只当**翻译器进程**：两份 GPL 不兼容（VIctory GPL-3.0-or-later，XCL GPL-2.0-only），
