@@ -29,7 +29,7 @@ XCL = os.path.join(GTA6, "xcl", "target", "release", "xcl.exe")
 DXC = os.path.join(GTA6, "dxc", "bin", "x64")
 
 
-def one(container: str, out_root: str) -> tuple[bool, str]:
+def one(container: str, out_root: str, window_hi: str) -> tuple[bool, str]:
     data = open(container, "rb").read()
     key = blake3.blake3(data).hexdigest()
     sub = os.path.join(out_root, "shaders", key[:2])
@@ -39,7 +39,10 @@ def one(container: str, out_root: str) -> tuple[bool, str]:
     os.makedirs(sub, exist_ok=True)
     dxil = os.path.join(sub, key + ".dxil")
     env = dict(os.environ, XCL_DXC_DIR=DXC, XCL_NETWORK="0")
-    r = subprocess.run([XCL, "dxil", container, dxil], capture_output=True, text=True, env=env)
+    cmd = [XCL, "dxil", container, dxil]
+    if window_hi:
+        cmd += ["--window-hi", window_hi]
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if r.returncode != 0:
         try:
             os.remove(dxil)
@@ -67,6 +70,7 @@ def main() -> int:
     ap.add_argument("out")
     ap.add_argument("--limit", type=int, default=10**9)
     ap.add_argument("--jobs", type=int, default=6)
+    ap.add_argument("--window-hi", default="", help="console chunks the windows are, e.g. 13,15,16")
     a = ap.parse_args()
     files = [
         os.path.join(dp, f)
@@ -78,7 +82,7 @@ def main() -> int:
     made = failed = skipped = 0
     reasons: dict[str, int] = {}
     with ThreadPoolExecutor(max_workers=a.jobs) as ex:
-        for ok, why in ex.map(lambda c: one(c, a.out), files):
+        for ok, why in ex.map(lambda c: one(c, a.out, a.window_hi), files):
             if ok:
                 if why == "skip":
                     skipped += 1
