@@ -1,0 +1,93 @@
+diff --git a/crates/victory-gpu/src/pipeline.rs b/crates/victory-gpu/src/pipeline.rs
+index b1dc393..0872d03 100644
+--- a/crates/victory-gpu/src/pipeline.rs
++++ b/crates/victory-gpu/src/pipeline.rs
+@@ -98,6 +98,9 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
+ pub(crate) struct Translated {
+     pub(crate) host: victory_shader::emit::HostShader,
+     pub(crate) used: Vec<victory_shader::UsedResource>,
++    /// Whether the translation came from the XCL sidecar rather than our
++    /// translator ([`crate::xcl`]).
++    pub(crate) fallback: bool,
+ }
+ 
+ #[cfg(windows)]
+@@ -107,11 +110,12 @@ impl Shader {
+     pub(crate) fn translated(&self) -> Option<&Translated> {
+         self.translated
+             .get_or_init(|| {
+-                let done = translate(&self.container);
++                let done = translate(&self.container, self.stage);
+                 match &done {
+                     Ok(t) => tracing::info!(
+                         stage = self.stage,
+                         hash = %self.hash,
++                        fallback = t.fallback,
+                         user_data = t.host.user_data.len(),
+                         samplers = t.host.samplers.len(),
+                         "shader translated"
+@@ -130,7 +134,50 @@ impl Shader {
+ }
+ 
+ #[cfg(windows)]
+-fn translate(container: &[u8]) -> Result<Translated, String> {
++fn translate(container: &[u8], stage: &'static str) -> Result<Translated, String> {
++    // Forced (`VICTORY_XCL_FORCE`) even when we could translate it: the
++    // fallback is then the proof on shaders a short run actually reaches.
++    match crate::xcl::forced_translation(container, stage) {
++        Ok(Some(host)) => {
++            tracing::info!(
++                hash = &blake3::hash(container).to_hex()[..16],
++                "shader translated by the fallback (XCL sidecar, forced)"
++            );
++            return Ok(Translated {
++                host,
++                used: Vec::new(),
++                fallback: true,
++            });
++        }
++        Ok(None) => (),
++        Err(sidecar) => tracing::warn!(error = %sidecar, "forced sidecar unusable; trying native"),
++    }
++    match native(container) {
++        Ok(translated) => Ok(translated),
++        Err(native) => {
++            crate::xcl::dump_failed(container);
++            match crate::xcl::translated(container, stage) {
++                Ok(Some(host)) => {
++                    tracing::info!(
++                        hash = &blake3::hash(container).to_hex()[..16],
++                        "shader translated by the fallback (XCL sidecar)"
++                    );
++                    Ok(Translated {
++                        host,
++                        used: Vec::new(),
++                        fallback: true,
++                    })
++                }
++                Ok(None) => Err(native),
++                Err(sidecar) => Err(format!("{native}; sidecar: {sidecar}")),
++            }
++        }
++    }
++}
++
++/// Our own translation of a container.
++#[cfg(windows)]
++fn native(container: &[u8]) -> Result<Translated, String> {
+     use victory_shader::{Container, FourCC, HwStage};
+     let host = crate::shader_cache::host_shader(container)?;
+     let c = Container::parse(container).map_err(|e| e.to_string())?;
+@@ -148,7 +195,11 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
+             .unwrap_or_default(),
+         None => Vec::new(),
+     };
+-    Ok(Translated { host, used })
++    Ok(Translated {
++        host,
++        used,
++        fallback: false,
++    })
+ }
+ 
+ #[repr(C)]

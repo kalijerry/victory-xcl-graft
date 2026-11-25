@@ -1,0 +1,1034 @@
+diff --git a/crates/victory-gpu/src/xcl.rs b/crates/victory-gpu/src/xcl.rs
+new file mode 100644
+index 0000000..c19ecd4
+--- /dev/null
++++ b/crates/victory-gpu/src/xcl.rs
+@@ -0,0 +1,1028 @@
++//! Shaders another project translated, kept beside a run: the XCL
++//! sidecar.
++//!
++//! VIctory's own translator stops at a few thousand console programs
++//! (64-bit image atomics, scalar memory reads used as data, descriptor
++//! reads used as data, ...). The other project, XCL, translates those, and
++//! `xcl dxil <container-file> <out.dxil>` writes the DXIL for one
++//! container. The fallback here makes VIctory use such a translation
++//! instead of dropping the pipelines' draws, without changing anything
++//! when the sidecar is absent: the native translation is always tried
++//! first, and this directory is only consulted after it failed.
++//!
++//! Disabled unless `VICTORY_XCL_SHADERS` names a directory. The entry for
++//! a container is `<dir>/<blake3 hex of the container>.json` 鈥?the full
++//! 64 hex digits of the container bytes as the title passed them, exactly
++//! what XCL was run on:
++//!
++//! ```json
++//! {
++//!   "stage": "vs",
++//!   "dxil_file": "vs_octawind--37b1c0a3.dxil",
++//!   "user_data": [{ "index": 4, "slot": 2, "kind": "constants" }],
++//!   "samplers": [[146, 12582912, 407896064, 0, 0]],
++//!   "root_cbvs": [3],
++//!   "root_srvs": [7],
++//!   "windows": 2
++//! }
++//! ```
++//!
++//! `stage` is `vs`, `ps`, `cs` or `ms`; `dxil_file` is relative to the
++//! sidecar directory (or absolute). Every other field may be absent or
++//! empty and then binds nothing. `user_data` entries name the root
++//! parameter `slot` that fills user-data dword `index`; `kind` is
++//! `constants` (default) or `table`. `samplers` are console sampler words
++//! `[a, b, c, d]` of `s<n>` at position n (`xcl dxil` appends a comparison
++//! word, 0 or 1, which is accepted and ignored). `root_cbvs`/`root_srvs`
++//! are title root parameter indices.
++//!
++//! `windows` (1..4, absent = 1) is how many unified-memory windows (`u2..`)
++//! the DXIL addresses; `xcl dxil --windows N` writes it. One window is the
++//! direct form, whose accesses carry no window choice; more select a window
++//! by the address' high dword from `io[112]` (`xcl_uma_base`, see
++//! [`IO_UMA_BASE_HI`]). `uma_base_hi` (absent = 0, the low chunk) is the
++//! base's high dword the DXIL expects.
++//!
++//! The file must be a DXBC container with a `DXIL` part 鈥?a host DXIL
++//! container, the thing D3D12 hashes 鈥?and anything else is refused with a
++//! message naming the file.
++//!
++//! The DXIL `xcl dxil` writes uses XCL's shader ABI, not VIctory's: root
++//! UAVs `u0..u5` in space 0 (initial SGPRs and the unified memory windows)
++//! and static samplers in space 1. [`HostShader::xcl`] marks a shader for
++//! that ABI, and the host pipeline's root signature and the draw path
++//! treat it accordingly. `u0` is the stage's user data (and the window
++//! base), `u1` the descriptor window and `u2..` the memory windows: real
++//! title memory where the title mapped it, the blank upload buffer where a
++//! binding cannot be made (its out-of-range reads return zero rather than
++//! faulting).
++
++use std::path::{Path, PathBuf};
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::{Arc, Mutex, OnceLock};
++
++use serde::Deserialize;
++use victory_shader::emit::{HostShader, StaticSampler, UserData};
++use victory_shader::{Container, FourCC, HwStage, RootType};
++
++use crate::host::HostList;
++
++/// The sidecar directory, or `None` (fallback off) when
++/// `VICTORY_XCL_SHADERS` is unset or empty.
++fn dir() -> Option<&'static Path> {
++    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
++    DIR.get_or_init(|| {
++        let value = std::env::var_os("VICTORY_XCL_SHADERS")?;
++        let path = PathBuf::from(value);
++        (!path.as_os_str().is_empty()).then_some(path)
++    })
++    .as_deref()
++}
++
++/// Where `VICTORY_DUMP_FAILED` keeps the containers that did not
++/// translate, as `<full hex>.bin`, so one can be translated with XCL.
++fn dump_dir() -> Option<&'static Path> {
++    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
++    DIR.get_or_init(|| {
++        let value = std::env::var_os("VICTORY_DUMP_FAILED")?;
++        let path = PathBuf::from(value);
++        (!path.as_os_str().is_empty()).then_some(path)
++    })
++    .as_deref()
++}
++
++/// Writes a container whose native translation failed to
++/// `VICTORY_DUMP_FAILED`, if it is set. A file already there is left alone:
++/// the content hash names it.
++pub(crate) fn dump_failed(container: &[u8]) {
++    let Some(dir) = dump_dir() else {
++        return;
++    };
++    let path = dir.join(format!("{}.bin", blake3::hash(container).to_hex()));
++    if path.exists() {
++        return;
++    }
++    let _ = std::fs::create_dir_all(dir);
++    match std::fs::write(&path, container) {
++        Ok(()) => tracing::info!(
++            path = %path.display(),
++            hash = &blake3::hash(container).to_hex()[..16],
++            "failed shader container dumped"
++        ),
++        Err(e) => tracing::warn!(path = %path.display(), error = %e, "cannot dump a failed shader"),
++    }
++}
++
++/// Whether the fallback is forced for a container's hash, so its sidecar
++/// is used even when our own translation works: `VICTORY_XCL_FORCE` is
++/// `*`, or a comma/space separated list of 16 hex digit hash prefixes (as
++/// the log prints them). For proving the seam on shaders the title uses
++/// before it reaches any that do not translate.
++fn forced(hash: &str) -> bool {
++    static FORCED: OnceLock<Option<Vec<String>>> = OnceLock::new();
++    let Some(forced) = FORCED.get_or_init(|| {
++        let value = std::env::var("VICTORY_XCL_FORCE").ok()?;
++        Some(
++            value
++                .split([',', ' ', ';'])
++                .map(str::trim)
++                .filter(|h| !h.is_empty())
++                .map(str::to_ascii_lowercase)
++                .collect(),
++        )
++    }) else {
++        return false;
++    };
++    forced.iter().any(|f| f == "*" || hash.starts_with(f.as_str()))
++}
++
++/// The sidecar translation of `container`, `Ok(None)` when there is no
++/// sidecar entry for it. Errors when the entry exists but is unusable.
++pub(crate) fn translated(
++    container: &[u8],
++    pipeline_stage: &'static str,
++) -> Result<Option<HostShader>, String> {
++    let Some(dir) = dir() else {
++        return Ok(None);
++    };
++    let hash = blake3::hash(container).to_hex();
++    read(&dir.join(format!("{hash}.json")), dir, pipeline_stage, container)
++}
++
++/// The sidecar translation of `container` even when our own works, for
++/// `VICTORY_XCL_FORCE` ([`forced`]).
++pub(crate) fn forced_translation(
++    container: &[u8],
++    pipeline_stage: &'static str,
++) -> Result<Option<HostShader>, String> {
++    let Some(dir) = dir() else {
++        return Ok(None);
++    };
++    if !forced(&blake3::hash(container).to_hex()) {
++        return Ok(None);
++    }
++    read(
++        &dir.join(format!("{}.json", blake3::hash(container).to_hex())),
++        dir,
++        pipeline_stage,
++        container,
++    )
++}
++
++fn read(path: &Path, dir: &Path, pipeline_stage: &'static str, container: &[u8]) -> Result<Option<HostShader>, String> {
++    let json = match std::fs::read(path) {
++        Ok(json) => json,
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
++        Err(e) => return Err(format!("{}: {e}", path.display())),
++    };
++    let sidecar: Sidecar =
++        serde_json::from_slice(&json).map_err(|e| format!("{}: {e}", path.display()))?;
++    build(&sidecar, dir, pipeline_stage, container).map(Some)
++}
++
++/// One sidecar file. Unknown fields are ignored, so the producer can add
++/// more without breaking this reader.
++#[derive(Default, Deserialize)]
++struct Sidecar {
++    #[serde(default)]
++    stage: String,
++    #[serde(default)]
++    dxil_file: String,
++    #[serde(default)]
++    user_data: Vec<SidecarUserData>,
++    #[serde(default)]
++    samplers: Vec<Vec<u32>>,
++    #[serde(default)]
++    root_cbvs: Vec<u8>,
++    #[serde(default)]
++    root_srvs: Vec<u8>,
++    /// Memory windows the DXIL addresses (`u2..`); 1 (the direct form) for
++    /// entries written before the field existed.
++    #[serde(default = "one")]
++    windows: u32,
++    /// High dword of the window base the DXIL's `io[112]` expects. The
++    /// producer compiles only the window count; 0 (the low chunk) when
++    /// absent.
++    #[serde(default)]
++    uma_base_hi: u32,
++    /// The console chunk of each window (from the producer). Absent: contiguous from
++    /// `uma_base_hi`, which is the old meaning.
++    #[serde(default)]
++    window_hi: Vec<u32>,
++}
++
++fn one() -> u32 {
++    1
++}
++
++/// One user-data dword and the root parameter that fills it.
++#[derive(Deserialize)]
++struct SidecarUserData {
++    index: u32,
++    /// The root parameter that fills it; absent in the producer's xcl dxil output, which
++    /// only knows the container and not the title's root signature.
++    #[serde(default)]
++    slot: Option<u8>,
++    /// `constants` (default) or `table`.
++    #[serde(default)]
++    kind: String,
++}
++
++/// The stage a sidecar name means, and the pipeline stage name it should
++/// match.
++fn stage(name: &str) -> Option<(HwStage, &'static str)> {
++    Some(match name {
++        "vs" => (HwStage::Vs, "vertex"),
++        "ps" => (HwStage::Ps, "pixel"),
++        "cs" => (HwStage::Cs, "compute"),
++        "ms" => (HwStage::Ms, "mesh"),
++        _ => return None,
++    })
++}
++
++fn root_type(kind: &str) -> Result<RootType, String> {
++    match kind {
++        "" | "constants" => Ok(RootType::Constants),
++        "table" => Ok(RootType::Table),
++        other => Err(format!("unknown user_data kind {other:?}")),
++    }
++}
++
++/// The console root signature's parameters that arrive in user SGPRs, from the container's own
++/// DXIL/XDAT part (`native_programs`, as our lowering reads them). Empty when the program is not
++/// a console program: then only entries that name their root parameter can bind.
++fn layout_of(container: &[u8], sidecar_stage: &str) -> Vec<victory_shader::RootParam> {
++    let Ok(c) = Container::parse(container) else {
++        return Vec::new();
++    };
++    let Some(part) = c.part(FourCC::DXIL) else {
++        return Vec::new();
++    };
++    let Ok(programs) = victory_shader::native_programs(part.data) else {
++        return Vec::new();
++    };
++    let want = match sidecar_stage {
++        "vs" => HwStage::Vs,
++        "ps" => HwStage::Ps,
++        "cs" => HwStage::Cs,
++        "ms" => HwStage::Ms,
++        _ => return Vec::new(),
++    };
++    programs
++        .into_iter()
++        .find(|p| p.stage == want)
++        .map(|p| p.layout)
++        .unwrap_or_default()
++}
++
++fn build(sidecar: &Sidecar, dir: &Path, pipeline_stage: &'static str, container: &[u8]) -> Result<HostShader, String> {
++    let (stage, matching) = stage(&sidecar.stage)
++        .ok_or_else(|| format!("stage {:?} is not vs, ps, cs or ms", sidecar.stage))?;
++    if matching != pipeline_stage {
++        tracing::warn!(
++            sidecar = sidecar.stage,
++            pipeline = pipeline_stage,
++            "the sidecar stage is not the pipeline's; the pipeline may refuse it"
++        );
++    }
++    if sidecar.dxil_file.is_empty() {
++        return Err("no dxil_file".to_owned());
++    }
++    let file = Path::new(&sidecar.dxil_file);
++    let file = if file.is_absolute() {
++        file.to_path_buf()
++    } else {
++        dir.join(file)
++    };
++    let dxil = std::fs::read(&file).map_err(|e| format!("{}: {e}", file.display()))?;
++    check_dxil(&dxil, &file)?;
++    if sidecar.user_data.len() > 4096 || sidecar.samplers.len() > 256 {
++        return Err("implausible user_data or sampler count".to_owned());
++    }
++    // The user-data dwords the producer reported are rooted in the console root signature that
++    // travels inside the container itself (its DXIL/XDAT part), exactly as our own lowering reads
++    // it: dword `index` belongs to the parameter whose user-data range covers it, at offset
++    // `index - param.user_data`.
++    let layout = layout_of(container, &sidecar.stage);
++
++    let mut user_data = Vec::with_capacity(sidecar.user_data.len());
++    let mut without_slot = 0usize;
++    for entry in &sidecar.user_data {
++        match entry.slot {
++            // an explicit root parameter in the entry (a hand-written sidecar)
++            Some(slot) => user_data.push(UserData {
++                index: entry.index,
++                slot,
++                root: root_type(&entry.kind)?,
++                dword: 0,
++            }),
++            // the producer's raw report: resolve the dword against the console root signature
++            // the producer's raw report: the SGPR the program reads. `RootParam.user_data` is
++            // an absolute SGPR too, so the parameter that covers it names slot and kind.
++            None => match layout.iter().find(|p| {
++                // (a parameter without user SGPRs carries no dword: immediate samplers etc.)
++                p.sgprs > 0
++                    && u32::from(p.user_data) <= entry.index
++                    && entry.index < u32::from(p.user_data) + p.sgprs
++            }) {
++                Some(p) => user_data.push(UserData {
++                    index: entry.index,
++                    slot: p.slot,
++                    root: p.root,
++                    dword: entry.index - u32::from(p.user_data),
++                }),
++                None => without_slot += 1,
++            },
++        }
++    }
++    if without_slot > 0 {
++        // the producer's raw report (dword indexes only) cannot fill a root parameter yet:
++        // those entries stay out, and the draw path's blank buffer covers them
++        tracing::debug!(without_slot, "sidecar user_data without a root parameter");
++    }
++    let mut samplers = Vec::with_capacity(sidecar.samplers.len());
++    let mut static_samplers = Vec::with_capacity(sidecar.samplers.len());
++    for (n, words) in sidecar.samplers.iter().enumerate() {
++        let word: [u32; 4] = words
++            .get(..4)
++            .and_then(|w| w.try_into().ok())
++            .ok_or_else(|| format!("sampler {n} has fewer than four words"))?;
++        samplers.push(word);
++        static_samplers.push(StaticSampler::from_words(word));
++    }
++    let (mut root_cbvs, mut root_srvs) = (sidecar.root_cbvs.clone(), sidecar.root_srvs.clone());
++    root_cbvs.sort_unstable();
++    root_cbvs.dedup();
++    root_srvs.sort_unstable();
++    root_srvs.dedup();
++    // More windows than the ABI's root UAVs (`u2..u5`) are never addressed;
++    // a sidecar without the field keeps the direct, one-window form.
++    let windows = sidecar.windows.clamp(1, victory_shader::emit::XCL_ROOTS - 2);
++    Ok(HostShader {
++        stage,
++        dxil,
++        user_data,
++        samplers,
++        static_samplers,
++        root_cbvs,
++        root_srvs,
++        xcl: true,
++        xcl_windows: windows,
++        xcl_base_hi: sidecar.uma_base_hi,
++        xcl_window_hi: if sidecar.window_hi.is_empty() {
++            window_chunks(windows, sidecar.uma_base_hi)
++        } else {
++            sidecar.window_hi.iter().copied().take(windows as usize).collect()
++        },
++    })
++}
++
++/// Refuses anything but a DXBC container with a DXIL part: the client
++/// hashes those, and a bare bitcode blob or a wrong file otherwise only
++/// fails later, inside pipeline creation.
++fn check_dxil(dxil: &[u8], file: &Path) -> Result<(), String> {
++    if dxil.get(..4) != Some(b"DXBC") {
++        let magic: String = dxil
++            .iter()
++            .take(4)
++            .map(|&b| if b.is_ascii_graphic() { b as char } else { '.' })
++            .collect();
++        return Err(format!(
++            "{}: not a DXBC container (starts {magic:?}, not \"DXBC\")",
++            file.display()
++        ));
++    }
++    let c = Container::parse(dxil).map_err(|e| format!("{}: {e}", file.display()))?;
++    if c.part(FourCC::DXIL).is_none() {
++        return Err(format!(
++            "{}: a DXBC container without a DXIL part (a bare bitcode blob?)",
++            file.display()
++        ));
++    }
++    Ok(())
++}
++
++/// The address of one blank upload buffer, bound to every root UAV of a
++/// fallback shader until the sidecar fills the real bindings. One per
++/// run: out-of-range reads return zero, which keeps a program running
++/// instead of faulting.
++pub(crate) fn blank_uav() -> Option<u64> {
++    struct Blank {
++        gpu: u64,
++        _buffer: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
++    }
++    unsafe impl Send for Blank {}
++    unsafe impl Sync for Blank {}
++
++    const BLANK_SIZE: u64 = 1 << 20;
++
++    static BLANK: OnceLock<Option<Blank>> = OnceLock::new();
++    BLANK
++        .get_or_init(|| {
++            let host = crate::host::host()?;
++            let (buffer, _data) = host.upload_buffer(BLANK_SIZE)?;
++            // SAFETY: the buffer is live for the rest of the run.
++            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
++            tracing::info!(address = gpu, "blank buffer for externally translated shaders");
++            Some(Blank {
++                gpu,
++                _buffer: buffer,
++            })
++        })
++        .as_ref()
++        .map(|b| b.gpu)
++}
++
++/// The dword of `io` that carries the high dword of the memory window base:
++/// XCL's `IO_UMA_BASE_HI`, which a translation with more than one window
++/// loads at entry (`xcl_uma_base = io[112]`; reads select window
++/// `hi - xcl_uma_base`, `hi == 0` selects window 0).
++pub(crate) const IO_UMA_BASE_HI: usize = 112;
++
++/// Dwords of the `io` buffer a fallback stage needs: its user-data dwords
++/// and, with more than one window, the base dword.
++pub(crate) fn io_dwords(user_data: u32, windows: u32) -> u32 {
++    let n = if windows > 1 {
++        user_data.max(IO_UMA_BASE_HI as u32 + 1)
++    } else {
++        user_data
++    };
++    n.next_multiple_of(4).max(4)
++}
++
++/// One 4 GiB chunk of the console address space as a UAV: the byte offset
++/// of a console address in it is the address' low 32 bits, so it must start
++/// at the chunk base. Either an alias of the title's own committed memory
++/// (a placed resource over a heap imported from it: no copy, the GPU reads
++/// what the title wrote) or 鈥?when the chunk base is not a reservation
++/// start (the low chunk is not) 鈥?a committed system-memory copy of the
++/// title ranges in it, refreshed from the pages the title writes.
++struct Window {
++    _buffer: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
++    gpu: u64,
++    /// The chunk base and how much of the chunk `buffer` covers.
++    base: u64,
++    len: u64,
++    /// The title ranges inside it: what the copy takes and refreshes.
++    ranges: Vec<(u64, u64)>,
++    /// A mapped CPU copy; `None` for an alias.
++    data: Option<*mut u8>,
++    /// Nothing copied yet (the first use copies every range).
++    fresh: AtomicBool,
++}
++
++// SAFETY: D3D12 resources are free-threaded; `data` is only written by a
++// submission's deferred copies.
++unsafe impl Send for Window {}
++// SAFETY: as above.
++unsafe impl Sync for Window {}
++
++/// Bytes of a chunk a copy covers by default (the low chunk holds the
++/// descriptors and 32-bit buffers, mostly near its start): `VICTORY_XCL_WINDOW_CAP`
++/// in MiB overrides it.
++fn cap() -> u64 {
++    static CAP: OnceLock<u64> = OnceLock::new();
++    const DEFAULT: u64 = 1 << 30;
++    *CAP.get_or_init(|| {
++        let Some(mb) = std::env::var("VICTORY_XCL_WINDOW_CAP")
++            .ok()
++            .and_then(|v| v.trim().parse::<u64>().ok())
++            .filter(|&n| n > 0)
++        else {
++            return DEFAULT;
++        };
++        mb << 20
++    })
++}
++
++impl Window {
++    /// The window over chunk `chunk`, if the title has anything there.
++    fn new(chunk: u32) -> Option<Arc<Window>> {
++        let base = u64::from(chunk) << 32;
++        let end = base + (1u64 << 32);
++        let mut ranges: Vec<(u64, u64)> = crate::shadow::title_ranges()
++            .into_iter()
++            .filter(|&(start, stop)| start < end && stop > base)
++            .map(|(start, stop)| (start.max(base), stop.min(end)))
++            .collect();
++        // The low chunk also holds the descriptor heaps: `u1 res` reads
++        // them, and a shader of a newer ABI reads descriptors as data
++        // through the same window.
++        if chunk == 0 {
++            ranges.extend(
++                crate::descriptor::shader_heap_ranges()
++                    .into_iter()
++                    .filter(|&(start, stop)| start < end && stop > base)
++                    .map(|(start, stop)| (start.max(base), stop.min(end))),
++            );
++        }
++        ranges.sort_unstable();
++        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
++        for (start, stop) in ranges {
++            match merged.last_mut() {
++                Some(last) if start <= last.1 => last.1 = last.1.max(stop),
++                _ => merged.push((start, stop)),
++            }
++        }
++        if merged.is_empty() {
++            return None;
++        }
++        let wanted = merged.last()?.1 - base;
++        let len = wanted.min(cap()).max(crate::watch::PAGE as u64);
++        let len = len.next_multiple_of(crate::watch::PAGE as u64).min(1 << 32);
++        merged.retain(|&(start, _)| start < base + len);
++        for (_, stop) in &mut merged {
++            *stop = (*stop).min(base + len);
++        }
++        if wanted > len {
++            tracing::debug!(
++                chunk,
++                covered = len,
++                wanted,
++                "xcl window: the rest of the chunk reads 0 (VICTORY_XCL_WINDOW_CAP)"
++            );
++        }
++        let (buffer, data, gpu) = match Self::alias(chunk, base, len) {
++            Some((buffer, gpu)) => {
++                tracing::info!(
++                    chunk,
++                    base = format_args!("{base:#x}"),
++                    len,
++                    "xcl window: aliasing the title's memory"
++                );
++                return Some(Arc::new(Window {
++                    _buffer: buffer,
++                    gpu,
++                    base,
++                    len,
++                    ranges: merged,
++                    data: None,
++                    fresh: AtomicBool::new(false),
++                }));
++            }
++            None => {
++                // A committed copy: system memory (custom heap, L0, write
++                // back) so that it is cheap in VRAM and mappable.
++                let host = crate::host::host()?;
++                let (buffer, data) = host.shared_buffer(len)?;
++                crate::host::name(&buffer, || format!("xcl window {chunk}"));
++                // SAFETY: a live buffer.
++                let gpu = unsafe { buffer.GetGPUVirtualAddress() };
++                (buffer, data, gpu)
++            }
++        };
++        tracing::info!(
++            chunk,
++            base = format_args!("{base:#x}"),
++            len,
++            ranges = merged.len(),
++            "xcl window: committed copy of the title's memory"
++        );
++        Some(Arc::new(Window {
++            _buffer: buffer,
++            gpu,
++            base,
++            len,
++            ranges: merged,
++            data: Some(data),
++            fresh: AtomicBool::new(true),
++        }))
++    }
++
++    /// A placed resource (a UAV) over a heap imported from the title's own
++    /// memory at the chunk base, when there is a committed reservation
++    /// starting exactly there. `None`: a copy is needed.
++    fn alias(
++        chunk: u32,
++        base: u64,
++        len: u64,
++    ) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u64)> {
++        use windows::core::Interface;
++        use windows::Win32::Graphics::Direct3D12::*;
++        let _ = chunk;
++        let host = crate::host::host()?;
++        let dev3: ID3D12Device3 = host.device.cast().ok()?;
++        // SAFETY: a plain cast of our device and a query of the address'
++        // region; the address is the title's memory.
++        let heap: ID3D12Heap = unsafe { dev3.OpenExistingHeapFromAddress(base as *const _) }.ok()?;
++        // SAFETY: a live heap.
++        if unsafe { heap.GetDesc() }.SizeInBytes < len {
++            return None;
++        }
++        let desc = D3D12_RESOURCE_DESC {
++            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
++            Width: len,
++            Height: 1,
++            DepthOrArraySize: 1,
++            MipLevels: 1,
++            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
++                Count: 1,
++                Quality: 0,
++            },
++            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
++            // An address-imported heap is cross-adapter: so is its resource.
++            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
++                | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
++            ..Default::default()
++        };
++        let mut buffer: Option<ID3D12Resource> = None;
++        // SAFETY: live heap, fresh description; the resource stays alive
++        // with the window.
++        unsafe {
++            host.device
++                .CreatePlacedResource(&heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
++        }
++        .ok()?;
++        let buffer = buffer?;
++        // SAFETY: a live buffer.
++        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
++        Some((buffer, gpu))
++    }
++
++    /// Copies `[from, to)` of title memory into the copy (clipped to the
++    /// ranges it covers).
++    fn copy(&self, data: *mut u8, from: u64, to: u64) {
++        let from = from.max(self.base);
++        let to = to.min(self.base + self.len);
++        if from >= to {
++            return;
++        }
++        let at = (from - self.base) as usize;
++        let len = (to - from) as usize;
++        // SAFETY: `at + len` is inside the mapped buffer; the source is
++        // title memory and unreadable pages are left alone.
++        let dst = unsafe { std::slice::from_raw_parts_mut(data.add(at), len) };
++        crate::host::read_into(from as *const u8, dst);
++    }
++
++    /// Brings the copy up to date at submission: every range the first
++    /// time, then the 64 KiB pages the title wrote since.
++    fn refresh(&self) {
++        let Some(data) = self.data else {
++            return;
++        };
++        let all = self.fresh.swap(false, Ordering::Relaxed);
++        for &(start, end) in &self.ranges {
++            if all {
++                self.copy(data, start, end);
++                continue;
++            }
++            match crate::watch::writes(start as usize, end as usize, true) {
++                None => self.copy(data, start, end),
++                Some((_, written)) => {
++                    for (page, _) in written {
++                        let at = page as u64 * crate::watch::PAGE as u64;
++                        self.copy(data, at, at + crate::watch::PAGE as u64);
++                    }
++                }
++            }
++        }
++    }
++}
++
++/// Every window made so far by chunk (`None`: tried and nothing there).
++fn windows() -> std::sync::MutexGuard<'static, std::collections::HashMap<u32, Option<Arc<Window>>>> {
++    static WINDOWS: OnceLock<Mutex<std::collections::HashMap<u32, Option<Arc<Window>>>>> =
++        OnceLock::new();
++    WINDOWS
++        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
++        .lock()
++        .unwrap_or_else(|e| e.into_inner())
++}
++
++/// The window over chunk `chunk`, made on first use and cached (its failure
++/// too: a failed creation logs once).
++fn window(chunk: u32) -> Option<Arc<Window>> {
++    let mut map = windows();
++    if let Some(made) = map.get(&chunk) {
++        return made.clone();
++    }
++    let made = Window::new(chunk);
++    if made.is_none() {
++        tracing::debug!(chunk, "xcl window: nothing to bind (reads return 0)");
++    }
++    map.insert(chunk, made.clone());
++    made
++}
++
++/// The descriptor window (`u1 res`): chunk 0, where 32-bit descriptor
++/// pointers point.
++fn descriptor() -> Option<Arc<Window>> {
++    window(0)
++}
++
++/// Deferred refresh once per list: the copy is brought up to date before
++/// the submission runs (the first use copies all of it).
++fn schedule(list: &HostList, w: &Arc<Window>) {
++    if w.data.is_none() && !w.fresh.load(Ordering::Relaxed) {
++        return;
++    }
++    if !list.first_use(Arc::as_ptr(w) as usize) {
++        return;
++    }
++    let w = w.clone();
++    list.defer(move || w.refresh());
++}
++
++/// The root UAVs (`u1..u5`; `u0` is the caller's `io` buffer) a fallback
++/// stage binds, as GPU addresses. `None` roots are bound to the blank
++/// buffer.
++pub(crate) struct Roots {
++    /// `io[IO_UMA_BASE_HI]`: the window base's high dword, 0 for the low
++    /// chunk (`hi == 0` selects window 0, i.e. chunk 0).
++    pub(crate) base_hi: u32,
++    /// The console chunk of each window, in root order.
++    pub(crate) chunks: Vec<u32>,
++    pub(crate) roots: [Option<u64>; victory_shader::emit::XCL_ROOTS as usize],
++}
++
++/// The console address space chunks (`hi`) a stage's `u2..` bind, in root
++/// order from `base_hi`: at most the ABI's four memory roots.
++pub(crate) fn window_chunks(windows: u32, base_hi: u32) -> Vec<u32> {
++    (0..windows.clamp(1, victory_shader::emit::XCL_ROOTS - 2))
++        .map(|k| base_hi.saturating_add(k))
++        .collect()
++}
++
++/// Whether real window bindings are made; `VICTORY_XCL_BLANK=1` keeps the
++/// old blank buffer everywhere (a baseline to compare against).
++fn enabled() -> bool {
++    static ENABLED: OnceLock<bool> = OnceLock::new();
++    *ENABLED.get_or_init(|| {
++        !std::env::var("VICTORY_XCL_BLANK").is_ok_and(|v| v.trim() == "1")
++    })
++}
++
++/// The roots of a fallback stage: `u1 res` is the descriptor window, `u2..`
++/// `windows` memory windows from `base_hi` on. Every creation is lazy and
++/// cached; what cannot be made stays `None`.
++pub(crate) fn roots(list: &HostList, chunks: &[u32]) -> Roots {
++    let mut roots = [None; victory_shader::emit::XCL_ROOTS as usize];
++    if enabled() {
++        if let Some(w) = descriptor() {
++            schedule(list, &w);
++            roots[1] = Some(w.gpu);
++        }
++        let chunks = if enabled() { chunks } else { &[0u32][..] };
++    for (k, chunk) in chunks.iter().copied().enumerate() {
++            if let Some(w) = window(chunk) {
++                schedule(list, &w);
++                roots[2 + k] = Some(w.gpu);
++            }
++            // `None`: reads through it return 0, which the blank buffer
++            // would too, without its copy.
++        }
++    }
++    Roots { base_hi: chunks.first().copied().unwrap_or(0), chunks: chunks.to_vec(), roots }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    struct Fixture {
++        dir: &'static Path,
++        /// A container XCL translated for `vs_octawind.dxil`.
++        vs: &'static [u8],
++        /// Another for `ps_sample.dxil`, the decode test's own file.
++        ps: &'static [u8],
++    }
++
++    /// The sidecar directory of this test binary, made once (the fallback
++    /// reads `VICTORY_XCL_SHADERS` once, as a run does): two containers and
++    /// their `xcl dxil` outputs from the graft's samples
++    /// (`VICTORY_XCL_TEST_DIR`, default the workspace's `shader-samples`).
++    fn setup() -> Option<&'static Fixture> {
++        static FIXTURE: OnceLock<Option<Fixture>> = OnceLock::new();
++        FIXTURE
++            .get_or_init(|| {
++                let samples = std::env::var_os("VICTORY_XCL_TEST_DIR")
++                    .map(PathBuf::from)
++                    .unwrap_or_else(|| {
++                        PathBuf::from(
++                            r"C:\Users\z7299\Documents\deepseek-harness\default-workspace\gta6\shader-samples",
++                        )
++                    });
++                let vs = std::fs::read(samples.join("vs_octawind.bin")).ok()?;
++                let vs_dxil = std::fs::read(samples.join("vs_octawind.dxil")).ok()?;
++                let ps = std::fs::read(samples.join("PS_AlphaUnderwaterTransmissionPrefilter_3a57a806_Wrapped"))
++                    .ok()?;
++                let ps_dxil = std::fs::read(samples.join("ps_sample.dxil")).ok()?;
++                let dir = tempfile::tempdir().ok()?.keep();
++                std::fs::write(dir.join("vs_octawind.dxil"), &vs_dxil).ok()?;
++                std::fs::write(dir.join("ps_sample.dxil"), &ps_dxil).ok()?;
++                for (container, stage, name, samplers) in [
++                    (
++                        &vs,
++                        "vs",
++                        "vs_octawind.dxil",
++                        "[[146,12582912,407896064,0,0],[0,12582912,340787200,0,0],[0,12582912,407896064,0,0]]",
++                    ),
++                    (
++                        &ps,
++                        "ps",
++                        "ps_sample.dxil",
++                        "[[146,12582912,407896064,0,0]]",
++                    ),
++                ] {
++                    let json = format!(
++                        r#"{{"stage":"{stage}","dxil_file":"{name}","samplers":{samplers}}}"#
++                    );
++                    std::fs::write(
++                        dir.join(format!("{}.json", blake3::hash(container).to_hex())),
++                        json,
++                    )
++                    .ok()?;
++                }
++                let dir: &'static Path = Box::leak(dir.into_boxed_path());
++                let vs: &'static [u8] = Box::leak(vs.into_boxed_slice());
++                let ps: &'static [u8] = Box::leak(ps.into_boxed_slice());
++                // SAFETY: the tests share it; the fallback reads it once
++                // here and caches it, as a run does.
++                unsafe { std::env::set_var("VICTORY_XCL_SHADERS", dir) };
++                Some(Fixture { dir, vs, ps })
++            })
++            .as_ref()
++    }
++
++    #[test]
++    fn an_absent_sidecar_is_no_translation() {
++        if setup().is_none() {
++            eprintln!("no samples; skipped");
++            return;
++        }
++        assert_eq!(translated(b"DXBC nothing at all", "vertex"), Ok(None));
++    }
++
++    #[test]
++    fn a_sidecar_is_decoded_and_checked() {
++        let Some(fixture) = setup() else {
++            eprintln!("no samples; skipped");
++            return;
++        };
++        // A file that is not a DXIL container is refused with a clear
++        // message, then the real one decodes.
++        let sidecar = fixture
++            .dir
++            .join(format!("{}.json", blake3::hash(fixture.ps).to_hex()));
++        let dxil = std::fs::read(fixture.dir.join("ps_sample.dxil")).unwrap();
++        std::fs::write(fixture.dir.join("ps_sample.dxil"), b"BC\xc0\xde bitcode").unwrap();
++        let err = translated(fixture.ps, "pixel").unwrap_err();
++        std::fs::write(fixture.dir.join("ps_sample.dxil"), &dxil).unwrap();
++        assert!(err.contains("not a DXBC container"), "{err}");
++
++        let host = translated(fixture.ps, "pixel").unwrap().expect("the sidecar decodes");
++        assert!(host.xcl);
++        assert_eq!(host.stage, HwStage::Ps);
++        assert_eq!(host.dxil, dxil);
++
++        // Extra fields (the producer's) are ignored, and every contract
++        // field decodes: user-data entries, sampler words (the fifth,
++        // comparison one is tolerated), root views.
++        assert!(serde_json::from_slice::<Sidecar>(&std::fs::read(&sidecar).unwrap()).is_ok());
++        let full = br#"{"stage":"ps","dxil_file":"ps_sample.dxil",
++            "user_data":[{"index":4,"slot":2,"kind":"table"},
++                         {"index":5,"slot":1,"kind":"constants"}],
++            "samplers":[[1,2,3,4,1],[5,6,7,8,0]],"root_cbvs":[3,3],"root_srvs":[7]}"#;
++        std::fs::write(&sidecar, full).unwrap();
++        let host = translated(fixture.ps, "pixel")
++            .unwrap()
++            .expect("the sidecar decodes");
++        assert_eq!(host.user_data.len(), 2);
++        assert_eq!(host.user_data[0].root, RootType::Table);
++        assert_eq!(host.user_data[0].index, 4);
++        assert_eq!(host.user_data[1].root, RootType::Constants);
++        assert_eq!(host.samplers, [[1, 2, 3, 4], [5, 6, 7, 8]]);
++        assert_eq!(host.static_samplers.len(), 2);
++        assert_eq!(host.root_cbvs, [3]);
++        assert_eq!(host.root_srvs, [7]);
++
++        // The producer's own report (SGPR numbers, no root parameter) decodes as well: each one
++    // resolves through the container's root signature into slot and kind.
++    let layout = layout_of(fixture.ps, "ps");
++    let param = layout.iter().find(|p| p.sgprs > 0).expect("the sample reads user data");
++    let json = format!(
++        r#"{{"stage":"ps","dxil_file":"ps_sample.dxil","user_data":[{{"index":{}}},{{"index":{}}}],"reads_mem":true}}"#,
++        param.user_data,
++        param.user_data + 1
++    );
++    std::fs::write(&sidecar, json).unwrap();
++    let host = translated(fixture.ps, "pixel").unwrap().expect("the sidecar decodes");
++    assert_eq!(host.user_data.len(), 2, "both reported dwords resolve");
++    assert_eq!(host.user_data[0].slot, param.slot);
++    assert_eq!(host.user_data[0].root, param.root);
++    // each entry belongs to the parameter that covers its dword: index == param.user_data + dword
++    for u in &host.user_data {
++        let covered = layout
++            .iter()
++            .find(|p| p.sgprs > 0 && u32::from(p.user_data) <= u.index && u.index < u32::from(p.user_data) + p.sgprs)
++            .expect("every resolved entry is covered by a parameter");
++        assert_eq!(u.index, u32::from(covered.user_data) + u.dword);
++        assert_eq!(u.slot, covered.slot);
++    }
++    // An entry without a DXIL file is refused.
++        std::fs::write(&sidecar, br#"{"stage":"ps"}"#).unwrap();
++        assert_eq!(
++            translated(fixture.ps, "pixel"),
++            Err("no dxil_file".to_owned())
++        );
++        std::fs::write(
++            &sidecar,
++            br#"{"stage":"ps","dxil_file":"ps_sample.dxil"}"#,
++        )
++        .unwrap();
++    }
++
++    #[test]
++    fn the_contract_carries_a_window_count_and_base() {
++        let Some(fixture) = setup() else {
++            eprintln!("no samples; skipped");
++            return;
++        };
++        // A DXIL file of this test's own (the shared one is rewritten by the
++        // decode test, and the tests run in parallel).
++        let dxil = std::fs::read(fixture.dir.join("ps_sample.dxil")).unwrap();
++        std::fs::write(fixture.dir.join("win_sample.dxil"), &dxil).unwrap();
++        let sidecar = fixture
++            .dir
++            .join("win_sample.json");
++        // An entry without the fields is the direct, one-window form.
++        let before = br#"{"stage":"ps","dxil_file":"win_sample.dxil"}"#.to_vec();
++        std::fs::write(&sidecar, &before).unwrap();
++        let host = translated_for_win(&sidecar, fixture).expect("decodes");
++        assert_eq!(host.xcl_windows, 1);
++        assert_eq!(host.xcl_base_hi, 0);
++        // Both fields decode, and a count above the ABI's roots is clamped.
++        for (json, want, base) in [
++            (
++                br#"{"stage":"ps","dxil_file":"win_sample.dxil","windows":3,"uma_base_hi":13}"#
++                    .to_vec(),
++                3,
++                13,
++            ),
++            (
++                br#"{"stage":"ps","dxil_file":"win_sample.dxil","windows":9}"#.to_vec(),
++                4,
++                0,
++            ),
++            (
++                br#"{"stage":"ps","dxil_file":"win_sample.dxil","windows":0}"#.to_vec(),
++                1,
++                0,
++            ),
++        ] {
++            std::fs::write(&sidecar, &json).unwrap();
++            let host = translated_for_win(&sidecar, fixture).expect("decodes");
++            assert_eq!(host.xcl_windows, want);
++            assert_eq!(host.xcl_base_hi, base);
++        }
++    }
++
++    /// [`translated`] of a sidecar the test names itself (the fixture's own
++    /// entries are keyed by the container's hash).
++    fn translated_for_win(
++        sidecar: &Path,
++        fixture: &Fixture,
++    ) -> Result<HostShader, String> {
++        read(sidecar, fixture.dir, "pixel", fixture.ps)?.ok_or_else(|| "no entry".to_owned())
++    }
++
++    #[test]
++    fn io_and_the_memory_roots_follow_the_window_count() {
++        // Our own form: no window dword.
++        assert_eq!(io_dwords(0, 1), 4);
++        // The multi-window form reads `io[112]`: the buffer has room for it.
++        assert_eq!(io_dwords(0, 4), 116);
++        assert!((io_dwords(0, 4) as usize) > IO_UMA_BASE_HI);
++        assert_eq!(io_dwords(3, 4) % 4, 0);
++        assert_eq!(IO_UMA_BASE_HI, 112);
++        // `u2..` are chunks from the base, in root order, never past u5.
++        assert_eq!(window_chunks(1, 0), [0]);
++        assert_eq!(window_chunks(4, 0), [0, 1, 2, 3]);
++        assert_eq!(window_chunks(4, 13), [13, 14, 15, 16]);
++        assert_eq!(window_chunks(9, 0).len(), 4);
++    }
++
++    #[test]
++    #[cfg(windows)]
++    fn a_sidecar_shader_makes_a_host_pipeline() {
++        let Some(fixture) = setup() else {
++            eprintln!("no samples; skipped");
++            return;
++        };
++        let host = translated(fixture.vs, "vertex")
++            .unwrap()
++            .expect("the sidecar decodes");
++        let device = match victory_shader::emit::host::Host::new(true) {
++            Ok(device) => device,
++            Err(e) => {
++                eprintln!("no WARP device ({e}); skipped");
++                return;
++            }
++        };
++        let ps = victory_shader::emit::host::stub_ps();
++        if let Err(e) = device.pipeline(&host, &ps) {
++            panic!("pipeline refused: {e}");
++        }
++    }
++}

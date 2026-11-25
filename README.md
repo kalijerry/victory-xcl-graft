@@ -14,6 +14,8 @@ XCL 只当**翻译器进程**：两份 GPL 不兼容（VIctory GPL-3.0-or-later�
 > WARP 是诚实刻度（节拍稳、XCL 的 compute 跑不了）：失败 441 → 65、每帧丢 1,533 → 1,289。
 > 细节与它意味着什么：[docs/MEASUREMENTS.md](docs/MEASUREMENTS.md)。
 
+完整交付说明（数据修复、结合体、实测、复现、风险）：**[docs/DELIVERY.zh.md](docs/DELIVERY.zh.md)**。
+
 ## 进度
 
 对外追踪器把这条线放在 **67%** 一档（2026-11-24 19:5x；榜首 CGBJ 72%，私有、已进游戏）。

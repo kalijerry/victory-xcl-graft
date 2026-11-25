@@ -1,0 +1,70 @@
+diff --git a/crates/victory-gpu/src/pipeline/host.rs b/crates/victory-gpu/src/pipeline/host.rs
+index 00aa9aa..6990bf9 100644
+--- a/crates/victory-gpu/src/pipeline/host.rs
++++ b/crates/victory-gpu/src/pipeline/host.rs
+@@ -251,6 +251,15 @@ pub(crate) struct Stage {
+     /// Root parameters of its root views: (title root parameter, ours).
+     pub(crate) root_cbvs: Vec<(u8, u32)>,
+     pub(crate) root_srvs: Vec<(u8, u32)>,
++    /// First root parameter of an externally translated shader's ABI
++    /// (`u0..u5`, [`victory_shader::emit::XCL_ROOTS`] of them), `None`
++    /// for our own translations.
++    pub(crate) xcl: Option<u32>,
++    /// With `xcl`: memory windows the DXIL addresses and the high dword of
++    /// their base.
++    pub(crate) xcl_windows: u32,
++    pub(crate) xcl_base_hi: u32,
++    pub(crate) xcl_window_hi: Vec<u32>,
+ }
+ 
+ impl Stage {
+@@ -339,7 +348,36 @@ impl HostPipeline {
+                 user_data: None,
+                 root_cbvs: Vec::new(),
+                 root_srvs: Vec::new(),
++                xcl: None,
++                xcl_windows: 1,
++                xcl_base_hi: 0,
++            xcl_window_hi: Vec::new(),
+             };
++            if t.xcl {
++                // An externally translated shader reads XCL's shader ABI:
++                // the root UAVs `u0..u5` in space 0 (its initial SGPRs and
++                // its unified-memory windows).
++                stage.xcl = Some(params.len() as u32);
++                stage.xcl_windows = t.xcl_windows.clamp(
++                    1,
++                    victory_shader::emit::XCL_ROOTS - 2,
++                );
++                stage.xcl_base_hi = t.xcl_base_hi;
++                stage.xcl_window_hi = t.xcl_window_hi.clone();
++                for register in 0..victory_shader::emit::XCL_ROOTS {
++                    params.push(D3D12_ROOT_PARAMETER1 {
++                        ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
++                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
++                            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
++                                ShaderRegister: register,
++                                RegisterSpace: victory_shader::emit::XCL_SPACE,
++                                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
++                            },
++                        },
++                        ShaderVisibility: visibility,
++                    });
++                }
++            }
+             let dwords = t.user_data_dwords();
+             if dwords > 0 {
+                 stage.user_data = Some((params.len() as u32, dwords));
+@@ -395,7 +433,11 @@ impl HostPipeline {
+                     MinLOD: s.min_lod,
+                     MaxLOD: s.max_lod,
+                     ShaderRegister: n as u32,
+-                    RegisterSpace: SAMPLER_SPACE,
++                    RegisterSpace: if t.xcl {
++                        victory_shader::emit::XCL_SAMPLER_SPACE
++                    } else {
++                        SAMPLER_SPACE
++                    },
+                     ShaderVisibility: visibility,
+                 });
+             }

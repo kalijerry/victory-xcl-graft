@@ -1,0 +1,70 @@
+diff --git a/crates/victory-gpu/src/shader_cache.rs b/crates/victory-gpu/src/shader_cache.rs
+index 998ec71..8c03d78 100644
+--- a/crates/victory-gpu/src/shader_cache.rs
++++ b/crates/victory-gpu/src/shader_cache.rs
+@@ -89,8 +89,9 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
+         "shader.dxil"
+     }
+     fn version(&self) -> u32 {
+-        // The build fingerprint in the input does the versioning.
+-        1
++        // The build fingerprint in the input does the versioning; 2 added
++        // the external-ABI flag; 3 the memory windows and base.
++        3
+     }
+     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
+         self.ran.store(true, Ordering::Relaxed);
+@@ -175,6 +176,13 @@ fn encode(s: &HostShader) -> Vec<u8> {
+     word(&mut out, stage);
+     word(&mut out, s.dxil.len() as u32);
+     out.extend(&s.dxil);
++    word(&mut out, u32::from(s.xcl));
++    word(&mut out, s.xcl_windows);
++    word(&mut out, s.xcl_base_hi);
++    word(&mut out, s.xcl_window_hi.len() as u32);
++    for c in &s.xcl_window_hi {
++        word(&mut out, *c);
++    }
+     word(&mut out, s.user_data.len() as u32);
+     for u in &s.user_data {
+         for v in [u.index, u32::from(u.slot), root_code(u.root), u.dword] {
+@@ -235,6 +243,17 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
+     }
+     let stage = *STAGES.get(r.word()? as usize)?;
+     let dxil = r.list()?;
++    let xcl = r.word()? != 0;
++    let (xcl_windows, xcl_base_hi) = if xcl {
++        (r.word()?, r.word()?)
++    } else {
++        (1, 0)
++    };
++    let n = r.word()? as usize;
++    let mut xcl_window_hi = Vec::with_capacity(n.min(4));
++    for _ in 0..n {
++        xcl_window_hi.push(r.word()?);
++    }
+     let n = r.word()? as usize;
+     let mut user_data = Vec::with_capacity(n.min(256));
+     for _ in 0..n {
+@@ -274,6 +293,10 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
+         static_samplers,
+         root_cbvs,
+         root_srvs,
++        xcl,
++        xcl_windows,
++        xcl_base_hi,
++        xcl_window_hi,
+     })
+ }
+ 
+@@ -300,6 +323,10 @@ mod tests {
+             ])],
+             root_cbvs: vec![2],
+             root_srvs: vec![0, 3],
++            xcl: true,
++            xcl_windows: 2,
++            xcl_base_hi: 0,
++            xcl_window_hi: vec![13, 15],
+         }
+     }
+ 

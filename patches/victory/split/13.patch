@@ -1,0 +1,65 @@
+diff --git a/crates/victory-hle/src/modules/dstorage.rs b/crates/victory-hle/src/modules/dstorage.rs
+index c94146f..fe49f57 100644
+--- a/crates/victory-hle/src/modules/dstorage.rs
++++ b/crates/victory-hle/src/modules/dstorage.rs
+@@ -116,7 +116,9 @@ type Factory = *const Object;
+ /// Opens `path` for reading; the file object owns the handle.
+ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out: Out) -> HRESULT {
+     const GENERIC_READ: u32 = 0x8000_0000;
+-    const FILE_SHARE_READ: u32 = 1;
++    // READ | WRITE | DELETE, so archives being repaired in place by a torrent
++    // client can still be opened (the console never had that case).
++    const FILE_SHARE_ALL: u32 = 7;
+     const OPEN_EXISTING: u32 = 3;
+     if path.is_null() {
+         return E_INVALIDARG;
+@@ -125,7 +127,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
+     let handle = super::files::CreateFileW(
+         path,
+         GENERIC_READ,
+-        FILE_SHARE_READ,
++        FILE_SHARE_ALL,
+         std::ptr::null(),
+         OPEN_EXISTING,
+         0,
+@@ -144,7 +146,10 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
+     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
+     // SAFETY: a handle we just opened and nobody else owns.
+     let file = unsafe { std::fs::File::from_raw_handle(handle) };
+-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
++    let file = Instance::create(
++        Object::new("dstorage file", &FILE_VTABLE),
++        File { file, path: name },
++    );
+     put(out, file)
+ }
+ 
+@@ -258,6 +263,8 @@ static FACTORY_VTABLE: Methods<16> = Methods([
+ 
+ struct File {
+     file: std::fs::File,
++    /// Keep the path so a failed request can say which file it read.
++    path: String,
+ }
+ 
+ static FILE_VTABLE: Methods<8> = Methods([
+@@ -787,9 +794,19 @@ extern "system" fn close(this: QueueRef) {
+ /// Reads, inflates and/or unpacks, and writes one request.
+ fn execute(request: &Request) -> Result<(), HRESULT> {
+     let options = request.options;
++    let source_path = if options & MEMORY_SOURCE != 0 || request.source.is_null() {
++        String::from("(memory)")
++    } else {
++        // SAFETY: a file object we created; the title keeps it open.
++        unsafe { &*request.source.cast::<Instance<File>>() }
++            .state
++            .path
++            .clone()
++    };
+     let fail = |hr: HRESULT, why: &str| {
+         tracing::warn!(
+             options = format_args!("{options:#x}"),
++            source_path = source_path,
+             offset = request.offset,
+             source_size = request.source_size,
+             destination_size = request.destination_size,

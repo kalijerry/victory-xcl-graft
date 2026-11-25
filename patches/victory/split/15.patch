@@ -1,0 +1,19 @@
+diff --git a/crates/victory-hle/src/modules/xmem.rs b/crates/victory-hle/src/modules/xmem.rs
+index a441c91..fdfac65 100644
+--- a/crates/victory-hle/src/modules/xmem.rs
++++ b/crates/victory-hle/src/modules/xmem.rs
+@@ -161,6 +161,14 @@ pub extern "system" fn XMemVirtualAlloc(
+             at = format_args!("{at:p}"),
+             "XMemVirtualAlloc"
+         );
++        if size >= 1 << 20 && flags & GRAPHICS != 0 && at as usize != 0 {
++            tracing::debug!(
++                size,
++                flags = format_args!("{flags:#x}"),
++                at = format_args!("{:#x}", at as usize),
++                "a large graphics allocation"
++            );
++        }
+     }
+     at
+ }

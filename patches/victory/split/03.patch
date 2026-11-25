@@ -1,0 +1,121 @@
+diff --git a/crates/victory-gpu/examples/heapprobe.rs b/crates/victory-gpu/examples/heapprobe.rs
+new file mode 100644
+index 0000000..c160971
+--- /dev/null
++++ b/crates/victory-gpu/examples/heapprobe.rs
+@@ -0,0 +1,115 @@
++锘?/! Probe: placed resources on WARP and on the hardware adapter.
++//! `cargo run --release -p victory-gpu --example heapprobe [hw]`
++
++fn main() {
++    unsafe { run() }
++}
++
++unsafe fn run() {
++    use windows::core::Interface;
++    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
++    use windows::Win32::Graphics::Direct3D12::*;
++    use windows_sys::Win32::System::Memory::*;
++    use windows_sys::Win32::System::Threading::GetCurrentProcess;
++
++    unsafe {
++        let mut dev: Option<ID3D12Device> = None;
++        let adapter = if std::env::args().any(|a| a == "hw") {
++            let factory: windows::Win32::Graphics::Dxgi::IDXGIFactory4 =
++                windows::Win32::Graphics::Dxgi::CreateDXGIFactory2(windows::Win32::Graphics::Dxgi::DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
++            let mut found = None;
++            let mut i = 0;
++            while let Ok(a) = factory.EnumAdapters1(i) {
++                i += 1;
++                let Ok(d) = a.GetDesc1() else { continue };
++                if d.Flags & windows::Win32::Graphics::Dxgi::DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
++                    continue;
++                }
++                found = Some(a);
++                break;
++            }
++            found
++        } else {
++            None
++        };
++        let r = match &adapter {
++            Some(a) => D3D12CreateDevice(a, D3D_FEATURE_LEVEL_12_0, &mut dev),
++            None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev),
++        };
++        println!("device: {:?}", r.map(|()| ()));
++        let Some(dev) = dev else { return };
++        let Ok(dev3) = dev.cast::<ID3D12Device3>() else {
++            println!("no ID3D12Device3");
++            return;
++        };
++        let mut desc = D3D12_RESOURCE_DESC {
++            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
++            Width: 1 << 20,
++            Height: 1,
++            DepthOrArraySize: 1,
++            MipLevels: 1,
++            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
++            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
++            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
++            ..Default::default()
++        };
++        let attempts: [(&str, D3D12_HEAP_PROPERTIES); 3] = [
++            ("default", D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }),
++            (
++                "custom-writeback-l0",
++                D3D12_HEAP_PROPERTIES {
++                    Type: D3D12_HEAP_TYPE_CUSTOM,
++                    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
++                    MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
++                    ..Default::default()
++                },
++            ),
++            (
++                "custom-writecombined-l0",
++                D3D12_HEAP_PROPERTIES {
++                    Type: D3D12_HEAP_TYPE_CUSTOM,
++                    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE,
++                    MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
++                    ..Default::default()
++                },
++            ),
++        ];
++        for (name, props) in attempts {
++            let hd = D3D12_HEAP_DESC { SizeInBytes: 1 << 20, Properties: props, Alignment: 0, Flags: D3D12_HEAP_FLAG_NONE }; let mut heap: Option<ID3D12Heap> = None; let heap: windows::core::Result<ID3D12Heap> = dev.CreateHeap(&hd, &mut heap).and_then(|()| heap.ok_or(windows::core::Error::empty()));
++            match &heap {
++                Ok(h) => {
++                    let d = h.GetDesc();
++                    let mut res: Option<ID3D12Resource> = None;
++                    let made = dev.CreatePlacedResource(h, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut res);
++                    println!("own heap {name}: flags {:?} size {} placed {:?}", d.Flags, d.SizeInBytes, made.map(|()| res.is_some()));
++                }
++                Err(e) => println!("own heap {name}: {e}"),
++            }
++        }
++        // imported heap over process memory
++        let p = VirtualAlloc((1usize << 32) as *const _, 1 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
++        println!("alloc: {p:?}");
++        if !p.is_null() {
++            match dev3.OpenExistingHeapFromAddress::<ID3D12Heap>(p) {
++                Ok(h) => {
++                    let d = h.GetDesc();
++                    let mut res: Option<ID3D12Resource> = None;
++                    let made = dev.CreatePlacedResource(&h, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut res);
++                    println!(
++                        "imported heap: flags {:?} size {} alignment {} placed {:?}",
++                        d.Flags,
++                        d.SizeInBytes,
++                        d.Alignment,
++                        made.map(|()| res.is_some())
++                    );
++                }
++                Err(e) => println!("imported heap: {e}"),
++            }
++            VirtualFree(p, 0, MEM_RELEASE);
++        }
++    }
++}
++
++
++
++

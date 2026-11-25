@@ -1,0 +1,14 @@
+diff --git a/crates/victory-shader/src/emit/valu_tests.rs b/crates/victory-shader/src/emit/valu_tests.rs
+index b4ee77d..a14aefe 100644
+--- a/crates/victory-shader/src/emit/valu_tests.rs
++++ b/crates/victory-shader/src/emit/valu_tests.rs
+@@ -148,6 +148,9 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
+         static_samplers: Vec::new(),
+         root_cbvs: lowered.root_cbvs,
+         root_srvs: lowered.root_srvs,
++        xcl: false,
++        xcl_windows: 1,
++        xcl_base_hi: 0,
+     };
+ 
+     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {

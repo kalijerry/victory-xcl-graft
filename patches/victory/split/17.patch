@@ -1,0 +1,178 @@
+diff --git a/crates/victory-shader/examples/xclprobe.rs b/crates/victory-shader/examples/xclprobe.rs
+new file mode 100644
+index 0000000..4c493a2
+--- /dev/null
++++ b/crates/victory-shader/examples/xclprobe.rs
+@@ -0,0 +1,172 @@
++//! Throwaway probe: does our host root signature / input layout accept an
++//! externally translated (XCL) DXIL? `xclprobe <vs|ps|cs> <file.dxil> [n]`.
++//!
++//! `n` sampler words are declared statically, as the sidecar would. The
++//! device is made with the debug layer so its messages name the refusal.
++
++use windows::core::Interface;
++use windows::Win32::Graphics::Direct3D12::*;
++use victory_shader::emit::host::{stub_ps, Host};
++use victory_shader::emit::{HostShader, StaticSampler};
++use victory_shader::HwStage;
++
++fn message_queue(device: &ID3D12Device) -> Option<ID3D12InfoQueue> {
++    device.cast().ok()
++}
++
++fn main() {
++    let args: Vec<String> = std::env::args().skip(1).collect();
++    if args.first().map(String::as_str) == Some("hash") {
++        let bytes = std::fs::read(&args[1]).expect("read");
++        println!("{}", blake3::hash(&bytes).to_hex());
++        return;
++    }
++    if args.first().map(String::as_str) == Some("nvs") {
++        let vs = victory_shader::emit::translate(&std::fs::read(&args[1]).unwrap()).expect("translate");
++        let host = Host::new(std::env::var_os("XCLPROBE_GPU").is_none()).expect("device");
++        match host.pipeline(&vs, &stub_ps()) {
++            Ok(_) => println!("pipeline created"),
++            Err(e) => println!("pipeline refused: {e}"),
++        }
++        return;
++    }
++    if args.first().map(String::as_str) == Some("xpair") {
++        let mk = |stage, path: &String| HostShader {
++            stage,
++            dxil: std::fs::read(path).unwrap(),
++            user_data: Vec::new(),
++            samplers: Vec::new(),
++            static_samplers: Vec::new(),
++            root_cbvs: Vec::new(),
++            root_srvs: Vec::new(),
++            xcl: true,
++        };
++        let host = Host::new(std::env::var_os("XCLPROBE_GPU").is_none()).expect("device");
++        match host.pipeline(&mk(HwStage::Vs, &args[1]), &mk(HwStage::Ps, &args[2])) {
++            Ok(_) => println!("pipeline created"),
++            Err(e) => println!("pipeline refused: {e}"),
++        }
++        return;
++    }
++    if args.first().map(String::as_str) == Some("pair") {
++        let vs = victory_shader::emit::translate(&std::fs::read(&args[1]).unwrap()).expect("translate vs");
++        let ps = HostShader {
++            stage: HwStage::Ps,
++            dxil: std::fs::read(&args[2]).unwrap(),
++            user_data: Vec::new(),
++            samplers: Vec::new(),
++            static_samplers: Vec::new(),
++            root_cbvs: Vec::new(),
++            root_srvs: Vec::new(),
++            xcl: std::env::var_os("XCLPROBE_NOXCL").is_none(),
++        };
++        let host = Host::new(std::env::var_os("XCLPROBE_GPU").is_none()).expect("device");
++        match host.pipeline(&vs, &ps) {
++            Ok(_) => println!("pipeline created"),
++            Err(e) => println!("pipeline refused: {e}"),
++        }
++        return;
++    }
++    let stage = match args.first().map(String::as_str) {
++        Some("vs") => HwStage::Vs,
++        Some("ps") => HwStage::Ps,
++        Some("cs") => HwStage::Cs,
++        _ => {
++            eprintln!("usage: xclprobe <vs|ps|cs> <file.dxil> [samplers]");
++            std::process::exit(2);
++        }
++    };
++    let samplers: usize = args.get(2).and_then(|n| n.parse().ok()).unwrap_or(0);
++    let dxil = std::fs::read(&args[1]).expect("read dxil");
++    let words = [0x2000_3003u32, 0x00FF_F000, 0x1850_0000, 0x8000_0000];
++    let shader = HostShader {
++        stage,
++        dxil,
++        user_data: Vec::new(),
++        samplers: vec![words; samplers],
++        static_samplers: vec![StaticSampler::from_words(words); samplers],
++        root_cbvs: Vec::new(),
++        root_srvs: Vec::new(),
++        xcl: true,
++    };
++    // SAFETY: plain creation of a WARP device with the debug layer.
++    let device = unsafe {
++        let mut debug: Option<ID3D12Debug> = None;
++        match D3D12GetDebugInterface(&mut debug) {
++            Ok(()) => {
++                debug.iter().for_each(|d| d.EnableDebugLayer());
++                println!("debug layer on");
++            }
++            Err(e) => println!("no debug layer: {e}"),
++        }
++        let factory: windows::Win32::Graphics::Dxgi::IDXGIFactory4 = windows::Win32::Graphics::Dxgi::CreateDXGIFactory2(
++            windows::Win32::Graphics::Dxgi::DXGI_CREATE_FACTORY_FLAGS(0),
++        )
++        .unwrap();
++        let warp = std::env::var_os("XCLPROBE_GPU").is_none();
++        let adapter: windows::Win32::Graphics::Dxgi::IDXGIAdapter = if warp {
++            factory.EnumWarpAdapter().unwrap()
++        } else {
++            factory.EnumAdapters(0).unwrap()
++        };
++        let ad = adapter.GetDesc().unwrap();
++        let name: String = ad.Description.iter().take_while(|c| **c != 0).map(|c| *c as u8 as char).collect();
++        println!("adapter {name}");
++        let mut device: Option<ID3D12Device> = None;
++        D3D12CreateDevice(&adapter, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0, &mut device)
++            .unwrap();
++        device.unwrap()
++    };
++    // SAFETY: feature query on a live device.
++    unsafe {
++        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
++        let _ = device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut o).cast(), std::mem::size_of_val(&o) as u32);
++        println!("wave ops={} min={} max={} total={} expanded={} int64={}", o.WaveOps.as_bool(), o.WaveLaneCountMin, o.WaveLaneCountMax, o.TotalLaneCount, o.ExpandedComputeResourceStates.as_bool(), o.Int64ShaderOps.as_bool());
++    }
++    let host = Host { device };
++    let ps = stub_ps();
++    match host.root_signature(&shader, &ps) {
++        Ok(_) => println!("root signature created"),
++        Err(e) => println!("root signature refused: {e}"),
++    }
++    let made = match stage {
++        HwStage::Cs => host.compute_pipeline(&shader).map(drop),
++        HwStage::Ps => match victory_shader::emit::host::stub_vs(&shader) {
++            Ok(vs) => host.pipeline(&vs, &shader).map(drop),
++            Err(e) => Err(format!("stub vs: {e}")),
++        },
++        _ => host.pipeline(&shader, &stub_ps()).map(drop),
++    };
++    match made {
++        Ok(()) => println!("pipeline created"),
++        Err(e) => println!("pipeline refused: {e}"),
++    }
++    if let Some(queue) = message_queue(&host.device) {
++        // SAFETY: a live queue.
++        let n = unsafe { queue.GetNumStoredMessages() };
++        for i in 0..n {
++            let mut len = 0;
++            // SAFETY: two-call idiom for a message buffer.
++            if unsafe {
++                queue.GetMessage(i, None, &mut len)
++            }
++            .is_err()
++            {
++                continue;
++            }
++            let mut buf = vec![0u8; len as usize];
++            let msg = buf.as_mut_ptr().cast::<D3D12_MESSAGE>();
++            if unsafe { queue.GetMessage(i, Some(msg), &mut len) }.is_ok() {
++                // SAFETY: the runtime filled `msg` for `len` bytes.
++                let msg = unsafe { &*msg };
++                // SAFETY: the description points into the runtime's message.
++                let text = unsafe {
++                    std::ffi::CStr::from_ptr(msg.pDescription.cast())
++                        .to_string_lossy()
++                        .into_owned()
++                };
++                println!("debug: {text}");
++            }
++        }
++    }
++}

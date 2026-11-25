@@ -1,0 +1,107 @@
+diff --git a/crates/victory-shader/src/emit/host.rs b/crates/victory-shader/src/emit/host.rs
+index dabd4a4..e21ba18 100644
+--- a/crates/victory-shader/src/emit/host.rs
++++ b/crates/victory-shader/src/emit/host.rs
+@@ -160,6 +160,27 @@ impl Host {
+         }
+         let mut samplers = Vec::new();
+         for &(s, vis) in stages {
++            // An externally translated shader reads XCL's shader ABI: the
++            // root UAVs `u0..u5` (initial SGPRs and memory windows), and
++            // samplers in space 1.
++            for register in 0..super::XCL_ROOTS {
++                params.push(D3D12_ROOT_PARAMETER1 {
++                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
++                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
++                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
++                            ShaderRegister: register,
++                            RegisterSpace: super::XCL_SPACE,
++                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
++                        },
++                    },
++                    ShaderVisibility: vis,
++                });
++            }
++            let space = if s.xcl {
++                super::XCL_SAMPLER_SPACE
++            } else {
++                super::SAMPLER_SPACE
++            };
+             for (n, d) in s.static_samplers.iter().enumerate() {
+                 let [u, v, w] = d.address.map(|a| D3D12_TEXTURE_ADDRESS_MODE(a as i32));
+                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
+@@ -174,7 +195,7 @@ impl Host {
+                     MinLOD: d.min_lod,
+                     MaxLOD: d.max_lod,
+                     ShaderRegister: n as u32,
+-                    RegisterSpace: super::SAMPLER_SPACE,
++                    RegisterSpace: space,
+                     ShaderVisibility: vis,
+                 });
+             }
+@@ -257,11 +278,11 @@ impl Host {
+         ps: &[u8],
+     ) -> Result<ID3D12PipelineState, String> {
+         let inputs = sig(vs, FourCC::ISG1)?;
+-        let names: Vec<CString> = inputs
++        let mut names: Vec<CString> = inputs
+             .iter()
+             .map(|e| CString::new(e.name.clone()).unwrap())
+             .collect();
+-        let layout: Vec<D3D12_INPUT_ELEMENT_DESC> = inputs
++        let mut layout: Vec<D3D12_INPUT_ELEMENT_DESC> = inputs
+             .iter()
+             .zip(&names)
+             .filter(|(e, _)| e.kind == 0)
+@@ -276,6 +297,23 @@ impl Host {
+             })
+             .collect();
+         let outputs = sig(ps, FourCC::OSG1)?;
++        // A vertex shader that reads only SV_VertexID/SV_InstanceID (every
++        // console vertex program: it fetches vertices itself) has no
++        // element of its own, and D3D12 refuses a pipeline with an empty
++        // input layout. One unreferenced element is enough.
++        if layout.is_empty() {
++            names.push(CString::new("POSITION").unwrap());
++            let name = names.last().unwrap();
++            layout.push(D3D12_INPUT_ELEMENT_DESC {
++                SemanticName: PCSTR(name.as_ptr().cast()),
++                SemanticIndex: 0,
++                Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
++                InputSlot: 0,
++                AlignedByteOffset: D3D12_APPEND_ALIGNED_ELEMENT,
++                InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
++                InstanceDataStepRate: 0,
++            });
++        }
+         let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+             // SAFETY: a borrowed pointer the descriptor never releases.
+             pRootSignature: unsafe { std::mem::transmute_copy(root) },
+@@ -508,10 +546,15 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
+             );
+         }
+     }
++    let narrow = std::env::var_os("XCLPROBE_NARROW").is_some();
+     s.outputs = outputs
+         .into_iter()
+         .map(|mut e| {
+-            e.usage = (1 << e.cols) - 1;
++            e.usage = if narrow && e.kind == 0 {
++                (1 << e.cols.min(3)) - 1
++            } else {
++                (1 << e.cols) - 1
++            };
+             e
+         })
+         .collect();
+@@ -528,6 +571,10 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
+         static_samplers: Vec::new(),
+         root_cbvs: Vec::new(),
+         root_srvs: Vec::new(),
++        xcl: false,
++        xcl_windows: 1,
++        xcl_window_hi: Vec::new(),
++        xcl_base_hi: 0,
+     }
+ }
+ 
