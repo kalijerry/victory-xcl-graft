@@ -2,7 +2,7 @@
 
 - 交付日期：2026-11-25
 - 机器：Windows 11 26300 / i9-14900KF / 48 GB / RTX 3080 10 GB（驱动 32.0.16.1088）
-- 数据：`E:\GTA6\GTA6.Xbox.v1.0.2.1-CYBERLEEK`（208 GB 泄露包 + 官方 exe）
+- 数据：本机 `<game>` 目录（208 GB 泄露包 + 官方 exe；下文路径里的 `gta6` 只是工作目录名）
 - 对外仓库：**https://github.com/kalijerry/victory-xcl-graft**（公开、GPL-3.0-or-later）
 
 ## 0. 摘要

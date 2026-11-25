@@ -1,117 +1,127 @@
-# VIctory ⇄ XCL 桥（victory-xcl-graft）
+# VIctory ⇄ XCL bridge (victory-xcl-graft)
 
-English: [README.en.md](README.en.md)
+Gives [VIctory](https://github.com/Marvisak/VIctory) the half it lacks — the RDNA2→DXIL
+translation that [XCL](https://github.com/ivall/xcl) covers 100% of — so world shaders are
+drawn instead of dropped. VIctory is the base; XCL is only a **translator process**.
+The two licences are incompatible (VIctory GPL-3.0-or-later, XCL GPL-2.0-only), so the bridge
+runs across a process boundary and hands over through a sidecar directory plus a single JSON
+line — no linking.
 
-把 [VIctory](https://github.com/Marvisak/VIctory) 缺的那一半——[XCL](https://github.com/ivall/xcl)
-100% 覆盖的 RDNA2→DXIL 翻译——接进 VIctory，让世界着色器不再被丢掉。VIctory 当基底，
-XCL 只当**翻译器进程**：两份 GPL 不兼容（VIctory GPL-3.0-or-later，XCL GPL-2.0-only），
-所以桥走在进程边界上，靠一个 sidecar 目录和一行 JSON 交接，不静态链接。
+> State (2026-11-24): **it runs and it is measured, but the image is not correct yet.**
+> On a real RTX 3080: distinct translate failures 424 → **45**, 120 shaders taken over by the
+> fallback, draws per frame 815 → 1,929; but XCL's DXIL is 10–100x larger than VIctory's own,
+> so pipeline creation queues ~320 entries and drops per frame *rise* 561 → 920.
+> WARP is the honest scale (steady pacing, XCL compute cannot run there): failures 441 → 65,
+> drops per frame 1,533 → 1,289. Why that is:
+> [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md).
 
-> 现状（2026-11-24）：**能跑通、能验证，但还不是正确画面。**
-> 真显卡 RTX 3080 上：不同翻译失败 424 → **45**、fallback 顶替 120 个 shader、
-> 每帧 draw 815 → 1,929；但 XCL 的 DXIL 比 VIctory 自己的大 10–100 倍，
-> PSO 创建把约 320 条排进队列，每帧"丢"的反而 561 → 920。
-> WARP 是诚实刻度（节拍稳、XCL 的 compute 跑不了）：失败 441 → 65、每帧丢 1,533 → 1,289。
-> 细节与它意味着什么：[docs/MEASUREMENTS.md](docs/MEASUREMENTS.md)。
+"the game" below means the newly released Xbox Series title; this repo never spells its name,
+and the `gta6` in paths is just the author's working directory.
 
-完整交付说明（数据修复、结合体、实测、复现、风险）：**[docs/DELIVERY.zh.md](docs/DELIVERY.zh.md)**。
+## Progress
 
-## 进度
+The public tracker puts this line at **67%** (2026-11-24 19:5x; CGBJ leads at 72%, private, in-game).
+**Boot → menus → legal → the opening CG on a real GPU at 1080p passes, and the run reaches world
+loading**; the blocker is a single ~5 s world-load submission that trips a driver TDR. Ladder,
+evidence, A/B and what is not done: **[docs/PROGRESS.md](docs/PROGRESS.md)**.
 
-对外追踪器把这条线放在 **67%** 一档（2026-11-24 19:5x；榜首 CGBJ 72%，私有、已进游戏）。
-**启动 → 菜单 → 法务 → 开场 CG（真显卡 1080p）通过，已跑到世界加载**；卡点是世界加载里一次
-5 秒的提交触发驱动 TDR。证据、阶梯、A/B 与"还没做"：**[docs/PROGRESS.md](docs/PROGRESS.md)**。
+Same frame, same sidecar, only the bindings switched (left = blank buffer, right = real bindings):
 
-同一帧、同一 sidecar，只切换绑定（左＝空白 buffer，右＝真绑定）：
-
-| 空白 buffer | 真绑定 |
+| blank | bound |
 |---|---|
 | ![blank](docs/screens/hw-blank-800.png) | ![bound](docs/screens/hw-bound-800.png) |
 
 ```
-frame-800：15 种颜色 / 13.9 KB / 一片平色   →   571 种颜色 / 3.5 MB / 真实画面
+frame-800: 15 colours / 13.9 KB / flat   ->   571 colours / 3.5 MB / real imagery
 ```
 
-真显卡 CG（`docs/screens/cg-360.png`、`cg-420.png`）：
+The CG on hardware (`docs/screens/cg-360.png`, `cg-420.png`):
 
 ![cg](docs/screens/cg-420.png)
 
-## 为什么不是"把两个项目合了"
+## Why not "merge the two projects"
 
-* 公开报道里的 CGBJ（私有）就是"VIctory 基底 + 借 XCL 的工作"这么进游戏的，代码没公开；
-* VIctory 社区正用**自己的 PR** 追同一批 4,003 个失败（`#953` +230、`#305`/`#539` +520 个程序），
-  但没人做跨项目桥；
-* 于是这里走反方向：**不移植规则，直接借翻译结果**，把两边的强项拼起来。
+* The private CGBJ build is exactly "VIctory base + borrowed XCL work" and it got in game; its
+  code is not public;
+* VIctory's own contributors are chasing the same 4,003 failures with their own PRs
+  (`#953` +230, `#305`/`#539` +520 programs), but nobody bridges the projects;
+* so this goes the other way: **don't port rules, borrow translation results** and put each
+  project's strength where it is.
 
-## 怎么工作
+## How it works
 
 ```
-[生产者]  xcl.exe dxil <容器> <out.dxil>        ← XCL 的翻译器（patches/xcl）
-              ↓ 一行 JSON：stage + 需要的 static sampler
-[搬运]    tools/fill_xcl_sidecar.py             ← 对失败容器算 BLAKE3，写 sidecar，断点续跑
-              ↓ shaders/<xx>/<blake3>.json + .dxil
-[消费者]  VIctory: VICTORY_XCL_SHADERS=<dir>    ← 翻译器优先，失败才查 sidecar（patches/victory）
+[producer]  xcl.exe dxil <container> <out.dxil>   ← XCL's translator (patches/xcl)
+                ↓ one JSON line: stage + the static samplers it needs
+[carrier]   tools/fill_xcl_sidecar.py             ← BLAKE3 of each failed container, writes
+                ↓ shaders/<xx>/<blake3>.json + .dxil   the sidecar, resumable
+[consumer]  VIctory: VICTORY_XCL_SHADERS=<dir>    ← native translator first, sidecar only
+                                                    after it failed (patches/victory)
 ```
 
-* 命中后按 **XCL 的 ABI** 建根签名（root UAV `u0..u5` space 0、采样器 space 1），draw 不再丢；
-* `VICTORY_DUMP_FAILED=<dir>` 把标题真的用到的、翻不出来的容器落盘，正好喂给生产者；
-* sidecar 全空时行为与上游完全一致（翻译器永远先跑）。
+A hit creates the root signature for **XCL's ABI** (root UAV `u0..u5` in space 0, static
+samplers in space 1) and the draw is no longer dropped. `VICTORY_DUMP_FAILED=<dir>` writes out
+every container the title actually used and the translator refused — exactly the producer's
+input. With an empty sidecar behaviour is upstream's.
 
-## 快速上手
+## Quick start
 
 ```powershell
-# 1. 打补丁（两棵树各自打）
+# 1. apply the patches (one series per tree)
 git clone https://github.com/Marvisak/VIctory; cd VIctory
 git apply ../patches/victory/0001-xcl-sidecar-fallback.patch
 git apply ../patches/victory/0002-cargo-lock.patch
 cargo build --release -p victory
 
 git clone https://github.com/ivall/xcl; cd ../xcl
-git apply ../patches/xcl/0001-dxil-producer-command.patch      # 及 0002..0006，见下
+git apply ../patches/xcl/0001-dxil-producer-command.patch   # and 0002..0006, see below
 cargo build --release -p xcl
 
-# 2. 跑一次标题，让失败容器落盘
+# 2. one run, so refused containers get dumped
 $env:VICTORY_DUMP_FAILED='...\failed'; $env:VICTORY_D3D12_WARP='1'
 .\victory.exe run <exe> --execute
 
-# 3. 生成 sidecar（XCL_DXC_DIR 指向 DXC 1.9+）
+# 3. build the sidecar (XCL_DXC_DIR must point at DXC 1.9+)
 $env:XCL_DXC_DIR='...\dxc\bin\x64'
 python tools\fill_xcl_sidecar.py ...\failed ...\sidecar
 
-# 4. 带着 sidecar 再跑
+# 4. run with the sidecar
 $env:VICTORY_XCL_SHADERS='...\sidecar'
 ```
 
-## 补丁清单（`patches/xcl`）
+## Patch list (`patches/xcl`)
 
-| 补丁 | 作用 | 是否必需 |
+| Patch | What | Required |
 |---|---|---|
-| 0001 | `xcl dxil` 生产者命令（VS/PS/CS，32-lane 走 split） | 必需 |
-| 0002 | 包标识按 33 字节缓冲返回（标题在 `System Init` 就断言） | 必需 |
-| 0003 | 读方允许写方（`FILE_SHARE_READ\|WRITE\|DELETE`），修复期间也能跑 | 强烈建议 |
-| 0004 | 上游 **#1321**：超长结构化代码回落 pc 块（commit 以 1 GB/s 涨到 115 GB 的根因） | 强烈建议 |
-| 0005 | 上游 **#1273**：bind 不等卡在队列后面的构建 | 建议 |
-| 0006 | 预加载路径的 `build_is_wanted` 漂移修正 | 建议 |
+| 0001 | the `xcl dxil` producer command (VS/PS/CS, split form for 32-lane devices) | yes |
+| 0002 | package identifier returned into a 33-byte buffer (the title asserts during `System Init` otherwise) | yes |
+| 0003 | readers admit writers (`FILE_SHARE_READ\|WRITE\|DELETE`), so it runs while the image is repaired | strongly |
+| 0004 | upstream **#1321**: oversized structured code falls back to `pc` blocks (the commit blow-up) | strongly |
+| 0005 | upstream **#1273**: a bind no longer waits behind the workers' queue | advised |
+| 0006 | `build_is_wanted` drift in the preload path | advised |
 
-`0002` 同时含 13 行 `[api]` 调试日志（warn 级），可自行删。
+`0002` also carries 13 `[api]` warning-level debug lines; drop them if too noisy.
 
-## 还缺什么（按优先级）
+## Still missing, in order
 
-1. **绑定面（已落地，画面仍不对）**：`u0 io` 现在是真的 per-draw UAV（user data + `io[112]` 窗口基址），`u1 res` 是描述符堆窗口，`u2..u5 mem` 是 sidecar 逐窗指名的 4 GiB 控制台 chunk（`--window-hi`）——优先用 `OpenExistingHeapFromAddress` 把标题自己的内存做成 placed UAV（零拷贝），没有现成保留就从标题写过的页懒拷一份（有上限、write-watch 刷新）。**仍错的**：只有 sidecar 指名的 chunk 被覆盖（标题的 UMA 在 13/15/16，逐窗列出已做；多窗编译慢得多）；着色器写进拷贝窗口不回写；拷贝是快照；零拷贝路径只在独立探针里验证过，硬件未跑；`user_data`、`u1 res` / `u2..u5 mem` 全空 → 现在只保证
-   "不丢、能 bind"，初值 SGPR 和地址读回 0，画面缺元素。需要 XCL 翻译时把"读了哪些
-   user-data dword、地址从哪个 u 寄存器来、对应哪个根参数"报出来。
-2. **大 DXIL 的编译积压**：XCL 的 DXIL 10–100 倍大，要做 sidecar 管线的离线预编译
-   （XCL 的 `pipelines` + 驱动 blob 缓存那套已验证可复用）并给 worker 限并发。
-3. **MS/GS 容器**（746 个失败）要两趟管线，`xcl dxil` 还不支持。
-4. 世界加载一次 4.8 s 提交触发驱动 TDR。
+1. **Bindings** (in progress): the producer reports `user_data` dwords and `reads_res`/`reads_mem` and the consumer decodes them; still to do: resolve `slot`/`kind` against the title root signature and bind `u1 res` / `u2..u5 mem` to title memory for real; `user_data`, `u1 res` and the `u2..u5 mem`
+   windows are empty, so today only "not dropped, binds" holds — initial SGPRs and address
+   reads come back 0 and scene elements are missing. XCL has to report which user-data dwords a
+   program reads, which `u` register an address term comes from, and which root parameter that
+   maps to.
+2. **Compile backlog from huge DXIL**: precompile sidecar pipelines offline (XCL's `pipelines`
+   plus its driver-blob cache is the proven shape) and cap the `make` workers.
+3. **MS/GS containers** (746 of the failures) need the two-pass pipeline; `xcl dxil` refuses them.
+4. One 4.8 s submission during world load trips a driver TDR.
 
-## 数据前提（重要）
+## Data prerequisite (important)
 
-该游戏（最新发售的那个 Xbox 标题，下面只叫「该游戏」，不写名字）的包本身不完整：**76/13,345 个 piece 坏、1.19 GiB**，`anim.rpf` 有 16 MiB 全零洞，
-两个项目都会在 `+0x4da6315` 撞同一个 `int3`。修复方法、`fastresume` 位图坑、
-共享句柄坑见 [docs/DATA.md](docs/DATA.md)。
+The leaked image is incomplete: **76 of 13,345 pieces bad, 1.19 GiB**, including a 16 MiB zero
+hole in `anim.rpf`; both projects die on the same `int3` at `+0x4da6315`. How to detect and
+repair it, the `fastresume` bitfield trap and the sharing-handle trap: [docs/DATA.md](docs/DATA.md).
 
-## 许可
+## Licence
 
-桥的胶水：GPL-3.0-or-later（同 VIctory）。文中不写该游戏的名字，路径里的 `gta6` 只是作者的工作目录名。`patches/xcl` 打到 GPL-2.0-only 的 XCL 上，
-各自保持自己的许可；两者只在运行期通过进程 + JSON 交接。仓库不含任何游戏数据。
+The bridge glue: GPL-3.0-or-later (like VIctory). `patches/xcl` apply to GPL-2.0-only XCL; each
+side keeps its own licence and they only meet at run time through a process + JSON.
+No game data in this repository.

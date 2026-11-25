@@ -24,9 +24,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 import blake3
 
-GTA6 = r"C:\Users\z7299\Documents\deepseek-harness\default-workspace\gta6"
-XCL = os.path.join(GTA6, "xcl", "target", "release", "xcl.exe")
-DXC = os.path.join(GTA6, "dxc", "bin", "x64")
+# `xcl.exe` and DXC: XCL_EXE / XCL_DXC_DIR, else a sibling `xcl` build of this workspace.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+XCL = os.environ.get("XCL_EXE") or os.path.join(_HERE, "..", "xcl", "target", "release", "xcl.exe")
+DXC = os.environ.get("XCL_DXC_DIR") or os.path.join(_HERE, "..", "dxc", "bin", "x64")
 
 
 def one(container: str, out_root: str, window_hi: str) -> tuple[bool, str]:

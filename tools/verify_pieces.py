@@ -1,8 +1,15 @@
 import hashlib, json, os
 
-BASE = r"E:\GTA6\GTA6.Xbox.v1.0.2.1-CYBERLEEK"
-LIST = r"C:\Users\z7299\Documents\deepseek-harness\default-workspace\gta6\bad-pieces.json"
-TORR = os.path.expandvars(r"%LOCALAPPDATA%\qBittorrent\BT_backup\465d6a0eac381e68ca77115f44f19f0c968b9590.torrent")
+# The game folder and the bad-piece list: argv, else GAME_DIR / TORRENT dir env, else the
+# folder this script sits next to. `bad-pieces.json` is produced by the check itself.
+import sys
+BASE = (sys.argv[1] if len(sys.argv) > 1 else os.environ.get("GAME_DIR")
+        or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "GAME"))
+LIST = (sys.argv[2] if len(sys.argv) > 2 else os.environ.get("BAD_PIECES")
+        or os.path.join(os.path.dirname(os.path.abspath(__file__)), "bad-pieces.json"))
+TORR = os.environ.get("TORRENT_FILE") or os.path.expandvars(
+    r"%LOCALAPPDATA%\qBittorrent\BT_backup\465d6a0eac381e68ca77115f44f19f0c968b9590.torrent"
+)
 
 
 def bdecode(b):
